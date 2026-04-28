@@ -157,14 +157,14 @@ CLI applications should use the **direct token exchange** endpoint instead of br
 **Access Token:**
 - **Format:** JWT signed with `JWT_SECRET`
 - **Payload:** `{ userId, role }`
-- **Lifetime:** 1 hour (configurable)
+- **Lifetime:** 3 Minutes (configurable)
 - **Usage:** Include in `Authorization: Bearer <token>` header on all authenticated requests
 - **Validation:** JWT signature is verified, and `is_active` status is checked on every request
 
 **Refresh Token:**
 - **Format:** JWT signed with `JWT_SECRET`
 - **Payload:** `{ userId }`
-- **Lifetime:** 30 days (configurable)
+- **Lifetime:** 5 minutes (configurable)
 - **Storage:** Stored in database per user
 - **Usage:** Call `POST /api/auth/refresh` to get new access token without re-authenticating
 - **Validation:** `is_active` status is checked before issuing a new access token

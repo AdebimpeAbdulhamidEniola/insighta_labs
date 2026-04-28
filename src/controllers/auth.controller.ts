@@ -114,7 +114,10 @@ export const handleGitHubCallback = async (
     const user = await resolveUser(tokenData.access_token, res);
     if (!user) return;
 
-    await issueTokens(user.id, user.role, res);
+    const accessToken = generateAccessToken(user.id, user.role)
+    const refreshToken = generateRefreshToken(user.id)
+    await setRefreshToken(user.id, refreshToken)
+    res.redirect(`${process.env.FRONTEND_URL}/callback?access_token=${accessToken}&refresh_token=${refreshToken}`)
   } catch (error) {
     next(error);
   }
