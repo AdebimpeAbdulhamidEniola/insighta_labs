@@ -1,0 +1,30 @@
+{
+    "compilerOptions": {
+        "target": "es2022",
+        "module": "Node16",
+
+        "lib": [
+            "es2022"
+        ],
+        "moduleResolution": "node16",
+        "strict": true,
+        "noImplicitAny": true,
+        "esModuleInterop": true,
+        "skipLibCheck": true,
+        "outDir": "./dist",
+        "paths": {
+            "@/*": [
+                "./src/*"
+            ]
+        },
+        "verbatimModuleSyntax": false
+    },
+    "include": [
+        "src/**/*.ts",
+        "prisma.config.ts",
+        "prisma/seed.ts"
+    ],
+    "exclude": [
+        "node_modules"
+    ]
+}
