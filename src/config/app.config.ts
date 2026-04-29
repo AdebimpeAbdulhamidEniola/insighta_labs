@@ -7,7 +7,7 @@ import { notFoundHandler } from "../utils/notfound.utils";
 import { errorHandler } from "../utils/errorhandler.utils";
 import ProfileRouter from "../routes/profile.route";
 import AuthRouter from "../routes/auth.route";
-import UsersRouter from "../routes/users.routes";
+import UsersRouter from "../routes/user.routes";
 
 dotenv.config();
 
