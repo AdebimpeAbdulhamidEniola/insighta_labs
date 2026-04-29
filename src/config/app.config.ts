@@ -7,6 +7,7 @@ import { notFoundHandler } from "../utils/notfound.utils";
 import { errorHandler } from "../utils/errorhandler.utils";
 import ProfileRouter from "../routes/profile.route";
 import AuthRouter from "../routes/auth.route";
+import UsersRouter from "../routes/users.routes";
 
 dotenv.config();
 
@@ -37,6 +38,8 @@ export const createApp = (): Application => {
   // Routes — auth stays at /auth as specified in the TRD
   app.use("/auth", AuthRouter);
   app.use("/api/profiles", ProfileRouter);
+  app.use("/api/users", UsersRouter);
+
 
   // Not Found Handler
   app.use(notFoundHandler);
