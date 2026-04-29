@@ -14,9 +14,9 @@ import { requireApiVersion } from "../middlewares/apiversion.middleware.js";
 const router = Router();
 
 // All profile routes require authentication, rate limiting, and API version header
+router.use(requireApiVersion);
 router.use(authenticate);
 router.use(apiRateLimiter);
-router.use(requireApiVersion);
 
 router.get("/", getAllProfiles);
 router.get("/search", searchProfiles);

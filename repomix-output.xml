@@ -65,6 +65,7 @@ src/model/auth.model.ts
 src/model/profile.model.ts
 src/routes/auth.route.ts
 src/routes/profile.route.ts
+src/routes/users.routes.ts
 src/services/agify.service.ts
 src/services/genderize.service.ts
 src/services/github.services.ts
@@ -21199,9 +21200,9 @@ import { requireApiVersion } from "../middlewares/apiversion.middleware.js";
 const router = Router();
 
 // All profile routes require authentication, rate limiting, and API version header
+router.use(requireApiVersion);
 router.use(authenticate);
 router.use(apiRateLimiter);
-router.use(requireApiVersion);
 
 router.get("/", getAllProfiles);
 router.get("/search", searchProfiles);
@@ -21209,6 +21210,34 @@ router.get("/export", exportProfiles);
 router.get("/:id", getProfileById);
 router.post("/", requireRole("admin"), createUserProfile);
 router.delete("/:id", requireRole("admin"), deleteUserProfile);
+
+export default router;
+</file>
+
+<file path="src/routes/users.routes.ts">
+import { Router } from "express";
+import { getMe } from "../controllers/auth.controller.js";
+import { authenticate } from "../middlewares/auth.middleware.js";
+import { apiRateLimiter } from "../middlewares/ratelimit.middleware.js";
+
+const router = Router();
+
+// All /api/users/* routes require authentication and rate limiting
+router.use(authenticate);
+router.use(apiRateLimiter);
+
+/**
+ * GET /api/users/me
+ *
+ * Returns the currently authenticated user's profile.
+ * Used by:
+ *  - CLI: insighta whoami command
+ *  - Web portal: account page
+ *
+ * No API version header required here — versioning applies
+ * only to profile-related endpoints per the TRD.
+ */
+router.get("/me", getMe);
 
 export default router;
 </file>
@@ -22677,57 +22706,6 @@ Contributions are welcome. To contribute:
 Please ensure your code compiles with `npm run build` before submitting a PR.
 </file>
 
-<file path="src/config/app.config.ts">
-import cors from "cors";
-import express, { Application } from "express";
-import cookieParser from "cookie-parser";
-import dotenv from "dotenv";
-import morgan from "morgan";
-import { notFoundHandler } from "../utils/notfound.utils";
-import { errorHandler } from "../utils/errorhandler.utils";
-import ProfileRouter from "../routes/profile.route";
-import AuthRouter from "../routes/auth.route";
-
-dotenv.config();
-
-export const createApp = (): Application => {
-  const app: Application = express();
-
-  app.disable("x-powered-by"); // Hide Express header for security
-
-  app.use(express.json());
-
-  // cookie-parser must come BEFORE routes so req.cookies is populated
-  // when the auth middleware reads the access_token cookie from web portal requests
-  app.use(cookieParser());
-
-  // Log every request including in production
-  app.use(morgan(process.env.NODE_ENV === "production" ? "combined" : "dev"));
-
-  // credentials: true is required so the browser sends HTTP-only cookies
-  // cross-origin (web portal origin → backend origin).
-  // The origin must be explicit (not "*") when credentials are involved.
-  app.use(
-    cors({
-      origin: process.env.FRONTEND_URL || "http://localhost:3001",
-      credentials: true,
-    })
-  );
-
-  // Routes — auth stays at /auth as specified in the TRD
-  app.use("/auth", AuthRouter);
-  app.use("/api/profiles", ProfileRouter);
-
-  // Not Found Handler
-  app.use(notFoundHandler);
-
-  // Error Handler
-  app.use(errorHandler);
-
-  return app;
-};
-</file>
-
 <file path="src/middlewares/auth.middleware.ts">
 import { Request, Response, NextFunction } from "express";
 import { verifyAccessToken } from "../utils/jwt.utils.js";
@@ -22891,6 +22869,60 @@ export const setRefreshToken = (userId: string, token: string | null) => {
     where: { id: userId },
     data: { refresh_token: token },
   });
+};
+</file>
+
+<file path="src/config/app.config.ts">
+import cors from "cors";
+import express, { Application } from "express";
+import cookieParser from "cookie-parser";
+import dotenv from "dotenv";
+import morgan from "morgan";
+import { notFoundHandler } from "../utils/notfound.utils";
+import { errorHandler } from "../utils/errorhandler.utils";
+import ProfileRouter from "../routes/profile.route";
+import AuthRouter from "../routes/auth.route";
+import UsersRouter from "../routes/users.routes";
+
+dotenv.config();
+
+export const createApp = (): Application => {
+  const app: Application = express();
+
+  app.disable("x-powered-by"); // Hide Express header for security
+
+  app.use(express.json());
+
+  // cookie-parser must come BEFORE routes so req.cookies is populated
+  // when the auth middleware reads the access_token cookie from web portal requests
+  app.use(cookieParser());
+
+  // Log every request including in production
+  app.use(morgan(process.env.NODE_ENV === "production" ? "combined" : "dev"));
+
+  // credentials: true is required so the browser sends HTTP-only cookies
+  // cross-origin (web portal origin → backend origin).
+  // The origin must be explicit (not "*") when credentials are involved.
+  app.use(
+    cors({
+      origin: process.env.FRONTEND_URL || "http://localhost:3001",
+      credentials: true,
+    })
+  );
+
+  // Routes — auth stays at /auth as specified in the TRD
+  app.use("/auth", AuthRouter);
+  app.use("/api/profiles", ProfileRouter);
+  app.use("/api/users", UsersRouter);
+
+
+  // Not Found Handler
+  app.use(notFoundHandler);
+
+  // Error Handler
+  app.use(errorHandler);
+
+  return app;
 };
 </file>
 
