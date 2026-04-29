@@ -13,15 +13,32 @@ declare global {
 }
 
 // Require authentication
-export const authenticate = async (req: Request, res: Response, next: NextFunction): Promise<void> => {
-  const authHeader = req.headers.authorization;
+// Supports two token sources to cover both interfaces defined in the TRD:
+//   1. Authorization: Bearer <token>  → used by CLI and direct API calls
+//   2. access_token cookie            → used by the web portal (HTTP-only, JS cannot read it)
+export const authenticate = async (
+  req: Request,
+  res: Response,
+  next: NextFunction
+): Promise<void> => {
+  let token: string | undefined;
 
-  if (!authHeader?.startsWith("Bearer ")) {
+  // Source 1 — Bearer header (CLI / API)
+  const authHeader = req.headers.authorization;
+  if (authHeader?.startsWith("Bearer ")) {
+    token = authHeader.substring(7);
+  }
+
+  // Source 2 — HTTP-only cookie (web portal)
+  // Only fall back to cookie if no Bearer header was present
+  if (!token && req.cookies?.access_token) {
+    token = req.cookies.access_token;
+  }
+
+  if (!token) {
     sendError(res, 401, "Authentication required");
     return;
   }
-
-  const token = authHeader.substring(7);
 
   const decoded = verifyAccessToken(token);
   if (!decoded) {
@@ -56,4 +73,3 @@ export const requireRole = (...allowedRoles: string[]) => {
     next();
   };
 };
-

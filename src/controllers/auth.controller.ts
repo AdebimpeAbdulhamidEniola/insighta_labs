@@ -25,6 +25,8 @@ import {
 // Web flow only — CLI holds its own codeVerifier locally
 const pkceStore = new Map<string, { codeVerifier: string; expiresAt: number }>();
 
+// ── Shared helpers ────────────────────────────────────────────────────────────
+
 const resolveUser = async (githubAccessToken: string, res: Response) => {
   const githubUser = await fetchGitHubUser(githubAccessToken);
   if (!githubUser) {
@@ -54,17 +56,7 @@ const resolveUser = async (githubAccessToken: string, res: Response) => {
   return user;
 };
 
-const issueTokens = async (userId: string, role: string, res: Response) => {
-  const accessToken = generateAccessToken(userId, role);
-  const refreshToken = generateRefreshToken(userId);
-  await setRefreshToken(userId, refreshToken);
-
-  res.status(200).json({
-    status: "success",
-    access_token: accessToken,
-    refresh_token: refreshToken,
-  });
-};
+// ── Web OAuth flow ────────────────────────────────────────────────────────────
 
 export const initiateGitHubAuth = (req: Request, res: Response): void => {
   const state = generateState();
@@ -79,6 +71,13 @@ export const initiateGitHubAuth = (req: Request, res: Response): void => {
   res.redirect(buildAuthorizationUrl(state, codeChallenge));
 };
 
+/**
+ * Web callback — GitHub redirects here after the user approves.
+ *
+ * Tokens are delivered via HTTP-only cookies so JavaScript in the web portal
+ * cannot read them (TRD requirement). After setting the cookies the browser
+ * is redirected to the web portal dashboard, completing the login seamlessly.
+ */
 export const handleGitHubCallback = async (
   req: Request,
   res: Response,
@@ -114,23 +113,53 @@ export const handleGitHubCallback = async (
     const user = await resolveUser(tokenData.access_token, res);
     if (!user) return;
 
-    const accessToken = generateAccessToken(user.id, user.role)
-    const refreshToken = generateRefreshToken(user.id)
-    await setRefreshToken(user.id, refreshToken)
-    res.redirect(`${process.env.FRONTEND_URL}/callback?access_token=${accessToken}&refresh_token=${refreshToken}`)
+    const accessToken = generateAccessToken(user.id, user.role);
+    const refreshToken = generateRefreshToken(user.id);
+    await setRefreshToken(user.id, refreshToken);
+
+    const isProduction = process.env.NODE_ENV === "production";
+
+    // Set access token as HTTP-only cookie — JS cannot read this
+    res.cookie("access_token", accessToken, {
+      httpOnly: true,
+      secure: isProduction,   // HTTPS only in production
+      sameSite: "lax",        // Protects against CSRF for cross-site navigations
+      maxAge: 3 * 60 * 1000, // 3 minutes — matches access token expiry
+    });
+
+    // Set refresh token as HTTP-only cookie — JS cannot read this
+    res.cookie("refresh_token", refreshToken, {
+      httpOnly: true,
+      secure: isProduction,
+      sameSite: "lax",
+      maxAge: 5 * 60 * 1000, // 5 minutes — matches refresh token expiry
+    });
+
+    // Redirect the browser to the web portal dashboard
+    // The portal is now authenticated via the cookies just set above
+    const portalUrl = process.env.WEB_PORTAL_URL || "http://localhost:3001";
+    res.redirect(`${portalUrl}/dashboard`);
   } catch (error) {
     next(error);
   }
 };
-// src/controllers/auth.controller.ts
 
+// ── CLI OAuth flow ────────────────────────────────────────────────────────────
+
+/**
+ * CLI callback — the CLI's local server captures the GitHub code, then POSTs
+ * it here along with the code_verifier it generated.
+ *
+ * Tokens are returned in the JSON body so the CLI can store them locally
+ * and attach them as Authorization: Bearer headers on future requests.
+ */
 export const handleCLICallback = async (
   req: Request,
   res: Response,
   next: NextFunction
 ): Promise<void> => {
   try {
-    const { code, code_verifier, redirect_uri } = req.body;  // ← ADD redirect_uri
+    const { code, code_verifier, redirect_uri } = req.body;
 
     if (!code || !code_verifier) {
       sendError(res, 400, "code and code_verifier are required");
@@ -139,25 +168,42 @@ export const handleCLICallback = async (
 
     const tokenData = await exchangeCodeForToken(code, code_verifier, redirect_uri);
     if (!tokenData || (tokenData as any).error) {
-      sendError(res, 502, `Token exchange failed: ${(tokenData as any)?.error || 'Unknown error'}`);
+      sendError(
+        res,
+        502,
+        `Token exchange failed: ${(tokenData as any)?.error || "Unknown error"}`
+      );
       return;
     }
 
     const user = await resolveUser(tokenData.access_token, res);
     if (!user) return;
 
-    await issueTokens(user.id, user.role, res);
+    const accessToken = generateAccessToken(user.id, user.role);
+    const refreshToken = generateRefreshToken(user.id);
+    await setRefreshToken(user.id, refreshToken);
+
+    // CLI receives tokens in JSON — it stores them locally (e.g. ~/.insighta/tokens.json)
+    res.status(200).json({
+      status: "success",
+      access_token: accessToken,
+      refresh_token: refreshToken,
+    });
   } catch (error) {
     next(error);
   }
 };
+
+// ── Token refresh ─────────────────────────────────────────────────────────────
+
 export const refreshAccessToken = async (
   req: Request,
   res: Response,
   next: NextFunction
 ): Promise<void> => {
   try {
-    const { refresh_token } = req.body;
+    // Accept refresh token from either JSON body (CLI) or cookie (web portal)
+    const refresh_token = req.body.refresh_token || req.cookies?.refresh_token;
 
     if (!refresh_token) {
       sendError(res, 400, "refresh_token is required");
@@ -183,22 +229,64 @@ export const refreshAccessToken = async (
       return;
     }
 
-    await issueTokens(user.id, user.role, res);
+    const newAccessToken = generateAccessToken(user.id, user.role);
+    const newRefreshToken = generateRefreshToken(user.id);
+    await setRefreshToken(user.id, newRefreshToken);
+
+    const isProduction = process.env.NODE_ENV === "production";
+
+    // If the request came from the web portal (cookie present), refresh via cookies
+    if (req.cookies?.refresh_token) {
+      res.cookie("access_token", newAccessToken, {
+        httpOnly: true,
+        secure: isProduction,
+        sameSite: "lax",
+        maxAge: 3 * 60 * 1000,
+      });
+      res.cookie("refresh_token", newRefreshToken, {
+        httpOnly: true,
+        secure: isProduction,
+        sameSite: "lax",
+        maxAge: 5 * 60 * 1000,
+      });
+      res.status(200).json({ status: "success", message: "Tokens refreshed" });
+      return;
+    }
+
+    // CLI gets new tokens in JSON body
+    res.status(200).json({
+      status: "success",
+      access_token: newAccessToken,
+      refresh_token: newRefreshToken,
+    });
   } catch (error) {
     next(error);
   }
 };
 
+// ── Whoami ────────────────────────────────────────────────────────────────────
 
-//the cli endpoint for whoami
 export const getMe = async (req: Request, res: Response): Promise<void> => {
   const user = await findUserById(req.user!.userId);
-  if (!user) { sendError(res, 404, "User not found"); return; }
+  if (!user) {
+    sendError(res, 404, "User not found");
+    return;
+  }
   res.status(200).json({
     status: "success",
-    ...user, // username, email, role, is_active, created_at, avatar_url
+    data: {
+      id: user.id,
+      username: user.username,
+      email: user.email,
+      role: user.role,
+      avatar_url: user.avatar_url,
+      is_active: user.is_active,
+      created_at: user.created_at,
+    },
   });
 };
+
+// ── Logout ────────────────────────────────────────────────────────────────────
 
 export const logout = async (
   req: Request,
@@ -206,8 +294,11 @@ export const logout = async (
   next: NextFunction
 ): Promise<void> => {
   try {
-    // req.user is set by authenticate middleware
     await setRefreshToken(req.user!.userId, null);
+
+    // Clear both cookies so the web portal session is fully terminated
+    res.clearCookie("access_token");
+    res.clearCookie("refresh_token");
 
     res.status(200).json({
       status: "success",
