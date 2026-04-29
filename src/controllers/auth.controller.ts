@@ -34,7 +34,6 @@ const resolveUser = async (githubAccessToken: string, res: Response) => {
     return null;
   }
 
-  // GitHub hides email if user set it to private — fall back to /user/emails
   const email = githubUser.email ?? (await fetchGitHubEmail(githubAccessToken));
   if (!email) {
     sendError(res, 400, "Email is required but not available");
@@ -56,7 +55,6 @@ const resolveUser = async (githubAccessToken: string, res: Response) => {
   return user;
 };
 
-// Reusable cookie options builder
 const cookieOptions = (maxAgeMs: number) => ({
   httpOnly: true,
   secure: process.env.NODE_ENV === "production",
@@ -81,7 +79,17 @@ export const initiateGitHubAuth = (req: Request, res: Response): void => {
 
 /**
  * Web callback — GitHub redirects here after the user approves.
- * Sets HTTP-only cookies and redirects browser to the frontend dashboard.
+ *
+ * WHY WE REDIRECT TO /callback AND NOT /dashboard:
+ *
+ * After OAuth the React app is a fresh mount — AuthContext has
+ * user = null and loading = true. If we redirect straight to /dashboard,
+ * ProtectedRoute sees user = null and immediately kicks the user back
+ * to /login before AuthContext even finishes calling getMe().
+ *
+ * By redirecting to /callback instead, the OAuthCallback component runs.
+ * It explicitly calls getMe(), sets the user in React state via login(),
+ * and THEN navigates to /dashboard. Session is fully established first.
  */
 export const handleGitHubCallback = async (
   req: Request,
@@ -124,8 +132,11 @@ export const handleGitHubCallback = async (
     res.cookie("access_token", accessToken, cookieOptions(3 * 60 * 1000));
     res.cookie("refresh_token", refreshToken, cookieOptions(5 * 60 * 1000));
 
+    // ✅ Redirect to /callback — NOT /dashboard
+    // OAuthCallback component calls getMe(), sets user in React state,
+    // then navigates to /dashboard. Protected route is never hit cold.
     const frontendUrl = process.env.FRONTEND_URL || "http://localhost:3001";
-    res.redirect(`${frontendUrl}/dashboard`);
+    res.redirect(`${frontendUrl}/callback`);
   } catch (error) {
     next(error);
   }
@@ -133,21 +144,6 @@ export const handleGitHubCallback = async (
 
 // ── CLI OAuth flow ────────────────────────────────────────────────────────────
 
-/**
- * CLI callback — the CLI's local server captures the GitHub code, then POSTs
- * it here along with the code_verifier it generated.
- *
- * FIX: We now return user info (username, role etc.) alongside the tokens.
- *
- * WHY THIS WAS BROKEN:
- * The old response only returned access_token and refresh_token.
- * The CLI tried to display "Logged in as [username]" but username was
- * never in the response — so it showed "unknown" as a fallback.
- *
- * Now the CLI gets everything it needs in a single response:
- *  - tokens to store locally for future requests
- *  - user info to display the success message immediately
- */
 export const handleCLICallback = async (
   req: Request,
   res: Response,
@@ -178,15 +174,13 @@ export const handleCLICallback = async (
     const refreshToken = generateRefreshToken(user.id);
     await setRefreshToken(user.id, refreshToken);
 
-    // Return tokens AND user info so CLI can display "Logged in as username"
-    // without needing to make a second request to /auth/me
     res.status(200).json({
       status: "success",
       access_token: accessToken,
       refresh_token: refreshToken,
       user: {
         id: user.id,
-        username: user.username,   // ← CLI uses this to display login success
+        username: user.username,
         email: user.email,
         role: user.role,
         avatar_url: user.avatar_url,
@@ -234,7 +228,6 @@ export const refreshAccessToken = async (
     const newRefreshToken = generateRefreshToken(user.id);
     await setRefreshToken(user.id, newRefreshToken);
 
-    // Web portal path — refresh via cookies
     if (req.cookies?.refresh_token) {
       res.cookie("access_token", newAccessToken, cookieOptions(3 * 60 * 1000));
       res.cookie("refresh_token", newRefreshToken, cookieOptions(5 * 60 * 1000));
@@ -246,7 +239,6 @@ export const refreshAccessToken = async (
       return;
     }
 
-    // CLI path — return new pair in JSON
     res.status(200).json({
       status: "success",
       access_token: newAccessToken,
@@ -259,10 +251,6 @@ export const refreshAccessToken = async (
 
 // ── Whoami ────────────────────────────────────────────────────────────────────
 
-/**
- * GET /api/users/me  (also available at GET /auth/me for CLI)
- * Only returns safe fields — refresh_token must NEVER leave the server.
- */
 export const getMe = async (req: Request, res: Response): Promise<void> => {
   const user = await findUserById(req.user!.userId);
   if (!user) {
