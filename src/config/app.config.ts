@@ -16,6 +16,8 @@ export const createApp = (): Application => {
 
   app.disable("x-powered-by"); // Hide Express header for security
 
+
+  app.set("trust proxy", 1); // Trust first proxy (important for correct client IP in rate limiting)
   app.use(express.json());
 
   // cookie-parser must come BEFORE routes so req.cookies is populated
