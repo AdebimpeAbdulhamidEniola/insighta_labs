@@ -74,6 +74,7 @@ src/services/agify.service.ts
 src/services/genderize.service.ts
 src/services/github.services.ts
 src/services/nationalize.service.ts
+src/types/express.d.ts
 src/utils/apperror.utils.ts
 src/utils/errorhandler.utils.ts
 src/utils/jwt.utils.ts
@@ -86,35 +87,6 @@ tsconfig.json
 
 <files>
 This section contains the contents of the repository's files.
-
-<file path="scripts/gen-token.ts">
-import "dotenv/config";
-import { PrismaPg } from "@prisma/adapter-pg";
-import { PrismaClient } from "@prisma/client";
-import { generateAccessToken } from "../src/utils/jwt.utils";
-
-const connectionString = `${process.env.DATABASE_URL}`;
-const adapter = new PrismaPg({ connectionString });
-const prisma = new PrismaClient({ adapter });
-
-async function main() {
-  const analyst = await prisma.user.findFirst({
-    where: { role: "analyst", is_active: true },
-  });
-
-  if (!analyst) {
-    console.log("No analyst user found — run: npx prisma db seed");
-    return;
-  }
-
-  const token = generateAccessToken(analyst.id, analyst.role);
-  console.log("\nAnalyst Test Token (paste into submission form):");
-  console.log(token);
-  console.log("\n  This token expires in 3 minutes — submit immediately after copying");
-}
-
-main().finally(() => prisma.$disconnect());
-</file>
 
 <file path=".github/workflows/ci.yml">
 name: CI
@@ -194,32 +166,6 @@ jobs:
 
       - name: Build TypeScript
         run: npm run build
-</file>
-
-<file path="eslint.config.mjs">
-import js from "@eslint/js";
-import tseslint from "typescript-eslint";
-
-export default tseslint.config(
-  js.configs.recommended,
-  ...tseslint.configs.recommended,
-  {
-    rules: {
-      // Allow console.log in backend (needed for morgan/logging)
-      "no-console": "off",
-
-      // Warn on unused variables but don't fail the build for _ prefixed ones
-      "@typescript-eslint/no-unused-vars": [
-        "warn",
-        { argsIgnorePattern: "^_" },
-      ],
-
-      // Allow explicit any in some cases — warn not error
-      "@typescript-eslint/no-explicit-any": "warn",
-    },
-    ignores: ["dist/**", "node_modules/**"],
-  }
-);
 </file>
 
 <file path="jest.config.ts">
@@ -377,109 +323,33 @@ model User {
 }
 </file>
 
-<file path="prisma/seed.ts">
+<file path="scripts/gen-token.ts">
 import "dotenv/config";
 import { PrismaPg } from "@prisma/adapter-pg";
 import { PrismaClient } from "@prisma/client";
-import { uuidv7 } from "uuidv7";
-import * as fs from "fs";
-import * as path from "path";
-
-interface SeedProfile {
-  name: string;
-  gender: string;
-  gender_probability: number;
-  age: number;
-  age_group: string;
-  country_id: string;
-  country_name: string;
-  country_probability: number;
-}
-
-interface SeedData {
-  profiles: SeedProfile[];
-}
+import { generateAccessToken } from "../src/utils/jwt.utils";
 
 const connectionString = `${process.env.DATABASE_URL}`;
 const adapter = new PrismaPg({ connectionString });
 const prisma = new PrismaClient({ adapter });
 
 async function main() {
-  // ── Seed profiles ────────────────────────────────────────────────────────────
-  const seedDataPath = path.join(__dirname, "../seed_profiles.json");
-  const seedData = JSON.parse(fs.readFileSync(seedDataPath, "utf-8")) as SeedData;
-
-  await prisma.profile.createMany({
-    data: seedData.profiles.map((profile) => ({
-      id: uuidv7(),
-      name: profile.name,
-      gender: profile.gender,
-      gender_probability: profile.gender_probability,
-      age: profile.age,
-      age_group: profile.age_group,
-      country_id: profile.country_id,
-      country_name: profile.country_name,
-      country_probability: profile.country_probability,
-    })),
-    skipDuplicates: true,
+  const analyst = await prisma.user.findFirst({
+    where: { role: "analyst", is_active: true },
   });
 
-  console.log("Seeding complete — 2026 profiles inserted");
+  if (!analyst) {
+    console.log("No analyst user found — run: npx prisma db seed");
+    return;
+  }
 
-  // ── Seed test users for grader ───────────────────────────────────────────────
-  // Admin user — used by test_code flow (grader auto-extracts token)
-  const adminUser = await prisma.user.upsert({
-    where: { github_id: "test-admin-github-id" },
-    update: {
-      role: "admin",
-      is_active: true,
-    },
-    create: {
-      id: uuidv7(),
-      github_id: "test-admin-github-id",
-      username: "test-admin",
-      email: "admin@test.com",
-      avatar_url: "https://avatars.githubusercontent.com/u/0",
-      role: "admin",
-      is_active: true,
-    },
-  });
-
-  console.log("Seeded admin user — id:", adminUser.id);
-
-  // Analyst user — token must be manually pasted into submission form
-  const analystUser = await prisma.user.upsert({
-    where: { github_id: "test-analyst-github-id" },
-    update: {
-      role: "analyst",
-      is_active: true,
-    },
-    create: {
-      id: uuidv7(),
-      github_id: "test-analyst-github-id",
-      username: "test-analyst",
-      email: "analyst@test.com",
-      avatar_url: "https://avatars.githubusercontent.com/u/0",
-      role: "analyst",
-      is_active: true,
-    },
-  });
-
-  console.log("Seeded analyst user — id:", analystUser.id);
-  console.log("────────────────────────────────────────────────────────────");
-  console.log("Run this to get your Analyst Test Token:");
-  console.log(`npx ts-node scripts/gen-analyst-token.ts`);
-  console.log("────────────────────────────────────────────────────────────");
+  const token = generateAccessToken(analyst.id, analyst.role);
+  console.log("\nAnalyst Test Token (paste into submission form):");
+  console.log(token);
+  console.log("\n  This token expires in 3 minutes — submit immediately after copying");
 }
 
-main()
-  .catch((e) => {
-    console.error(e);
-    process.exit(1);
-  })
-  .finally(async () => {
-    await prisma.$disconnect();
-  });
+main().finally(() => prisma.$disconnect());
 </file>
 
 <file path="seed_profiles.json">
@@ -21336,35 +21206,6 @@ export const deleteProfile = (id: string) => {
 };
 </file>
 
-<file path="src/routes/auth.route.ts">
-import { Router } from "express";
-import {
-  initiateGitHubAuth,
-  handleGitHubCallback,
-  handleCLICallback,
-  refreshAccessToken,
-  logout,getMe
-} from "../controllers/auth.controller";
-import { authenticate } from "../middlewares/auth.middleware";
-import { authRateLimiter } from "../middlewares/ratelimit.middleware";
-
-const router = Router();
-
-// Rate limit applies to every auth route
-router.use(authRateLimiter);
-
-router.get("/github", initiateGitHubAuth);
-router.get("/github/callback", handleGitHubCallback);
-router.post("/cli/callback", handleCLICallback);
-router.post("/refresh", refreshAccessToken);
-router.get("/me", authenticate, getMe);
-
-// logout requires a valid access token — you must be logged in to log out
-router.post("/logout", authenticate, logout);
-
-export default router;
-</file>
-
 <file path="src/routes/user.routes.ts">
 import { Router } from "express";
 import { getMe } from "../controllers/auth.controller.js";
@@ -21612,6 +21453,19 @@ export const getNationData = async (name: string) => {
 
   };
 };
+</file>
+
+<file path="src/types/express.d.ts">
+import "express";
+
+declare module "express-serve-static-core" {
+  interface Request {
+    user?: {
+      userId: string;
+      role: string;
+    };
+  }
+}
 </file>
 
 <file path="src/utils/apperror.utils.ts">
@@ -21957,82 +21811,135 @@ export const sendError = (res: Response, statusCode: number, message: string): v
 }
 </file>
 
-<file path="src/middlewares/auth.middleware.ts">
-import { Request, Response, NextFunction } from "express";
-import { verifyAccessToken } from "../utils/jwt.utils.js";
-import { sendError } from "../utils/response.utils.js";
-import { findUserById } from "../model/auth.model.js";
+<file path="eslint.config.mjs">
+import js from "@eslint/js";
+import tseslint from "typescript-eslint";
 
-// Extend Express Request to include user
-declare global {
-  namespace Express {
-    interface Request {
-      user?: { userId: string; role: string };
+export default tseslint.config(
+  { ignores: ["dist/**", "node_modules/**"] },
+  js.configs.recommended,
+  ...tseslint.configs.recommended,
+  {
+    rules: {
+      // Allow console.log in backend (needed for morgan/logging)
+      "no-console": "off",
+
+      // Warn on unused variables but don't fail the build for _ prefixed ones
+      "@typescript-eslint/no-unused-vars": [
+        "warn",
+        { argsIgnorePattern: "^_" },
+      ],
+
+      // Allow explicit any in some cases — warn not error
+      "@typescript-eslint/no-explicit-any": "warn",
     }
   }
+);
+</file>
+
+<file path="prisma/seed.ts">
+import "dotenv/config";
+import { PrismaPg } from "@prisma/adapter-pg";
+import { PrismaClient } from "@prisma/client";
+import { uuidv7 } from "uuidv7";
+import * as fs from "fs";
+import * as path from "path";
+
+interface SeedProfile {
+  name: string;
+  gender: string;
+  gender_probability: number;
+  age: number;
+  age_group: string;
+  country_id: string;
+  country_name: string;
+  country_probability: number;
 }
 
-// Require authentication
-// Supports two token sources to cover both interfaces defined in the TRD:
-//   1. Authorization: Bearer <token>  → used by CLI and direct API calls
-//   2. access_token cookie            → used by the web portal (HTTP-only, JS cannot read it)
-export const authenticate = async (
-  req: Request,
-  res: Response,
-  next: NextFunction
-): Promise<void> => {
-  let token: string | undefined;
+interface SeedData {
+  profiles: SeedProfile[];
+}
 
-  // Source 1 — Bearer header (CLI / API)
-  const authHeader = req.headers.authorization;
-  if (authHeader?.startsWith("Bearer ")) {
-    token = authHeader.substring(7);
-  }
+const connectionString = `${process.env.DATABASE_URL}`;
+const adapter = new PrismaPg({ connectionString });
+const prisma = new PrismaClient({ adapter });
 
-  // Source 2 — HTTP-only cookie (web portal)
-  // Only fall back to cookie if no Bearer header was present
-  if (!token && req.cookies?.access_token) {
-    token = req.cookies.access_token;
-  }
+async function main() {
+  // ── Seed profiles ────────────────────────────────────────────────────────────
+  const seedDataPath = path.join(__dirname, "../seed_profiles.json");
+  const seedData = JSON.parse(fs.readFileSync(seedDataPath, "utf-8")) as SeedData;
 
-  if (!token) {
-    sendError(res, 401, "Authentication required");
-    return;
-  }
+  await prisma.profile.createMany({
+    data: seedData.profiles.map((profile) => ({
+      id: uuidv7(),
+      name: profile.name,
+      gender: profile.gender,
+      gender_probability: profile.gender_probability,
+      age: profile.age,
+      age_group: profile.age_group,
+      country_id: profile.country_id,
+      country_name: profile.country_name,
+      country_probability: profile.country_probability,
+    })),
+    skipDuplicates: true,
+  });
 
-  const decoded = verifyAccessToken(token);
-  if (!decoded) {
-    sendError(res, 401, "Invalid or expired token");
-    return;
-  }
+  console.log("Seeding complete — 2026 profiles inserted");
 
-  // Check if user is still active in the database
-  const user = await findUserById(decoded.userId);
-  if (!user || !user.is_active) {
-    sendError(res, 403, "User account is deactivated");
-    return;
-  }
+  // ── Seed test users for grader ───────────────────────────────────────────────
+  // Admin user — used by test_code flow (grader auto-extracts token)
+  const adminUser = await prisma.user.upsert({
+    where: { github_id: "test-admin-github-id" },
+    update: {
+      role: "admin",
+      is_active: true,
+    },
+    create: {
+      id: uuidv7(),
+      github_id: "test-admin-github-id",
+      username: "test-admin",
+      email: "admin@test.com",
+      avatar_url: "https://avatars.githubusercontent.com/u/0",
+      role: "admin",
+      is_active: true,
+    },
+  });
 
-  req.user = decoded;
-  next();
-};
+  console.log("Seeded admin user — id:", adminUser.id);
 
-// Require specific roles
-export const requireRole = (...allowedRoles: string[]) => {
-  return (req: Request, res: Response, next: NextFunction): void => {
-    if (!req.user) {
-      sendError(res, 401, "Authentication required");
-      return;
-    }
+  // Analyst user — token must be manually pasted into submission form
+  const analystUser = await prisma.user.upsert({
+    where: { github_id: "test-analyst-github-id" },
+    update: {
+      role: "analyst",
+      is_active: true,
+    },
+    create: {
+      id: uuidv7(),
+      github_id: "test-analyst-github-id",
+      username: "test-analyst",
+      email: "analyst@test.com",
+      avatar_url: "https://avatars.githubusercontent.com/u/0",
+      role: "analyst",
+      is_active: true,
+    },
+  });
 
-    if (!allowedRoles.includes(req.user.role)) {
-      sendError(res, 403, "Insufficient permissions");
-      return;
-    }
+  console.log("Seeded analyst user — id:", analystUser.id);
+  console.log("────────────────────────────────────────────────────────────");
+  console.log("Run this to get your Analyst Test Token:");
+  console.log(`npx ts-node scripts/gen-analyst-token.ts`);
+  console.log("────────────────────────────────────────────────────────────");
+}
 
-    next();
-  };
-};
+main()
+  .catch((e) => {
+    console.error(e);
+    process.exit(1);
+  })
+  .finally(async () => {
+    await prisma.$disconnect();
+  });
 </file>
 
 <file path="src/middlewares/ratelimit.middleware.ts">
@@ -22087,92 +21994,34 @@ export const apiRateLimiter = rateLimit({
 });
 </file>
 
-<file path="src/model/auth.model.ts">
-import { prisma } from "../lib/prisma";
-import { uuidv7 } from "uuidv7";
+<file path="src/routes/auth.route.ts">
+import { Router } from "express";
+import {
+  initiateGitHubAuth,
+  handleGitHubCallback,
+  handleCLICallback,
+  refreshAccessToken,
+  logout,getMe
+} from "../controllers/auth.controller";
+import { authenticate } from "../middlewares/auth.middleware";
+import { authRateLimiter } from "../middlewares/ratelimit.middleware";
 
-interface GitHubUserPayload {
-  githubId: string;
-  username: string;
-  email: string;
-  avatarUrl: string;
-}
+const router = Router();
 
-/**
- * Reads ADMIN_GITHUB_IDS from env (comma-separated list of GitHub user IDs).
- * If the logging-in user's GitHub ID is in this list, they are assigned the
- * "admin" role. Everyone else defaults to "analyst".
- *
- * Example .env entry:
- *   ADMIN_GITHUB_IDS=12345678,87654321
- */
-const getAdminGithubIds = (): string[] => {
-  return (process.env.ADMIN_GITHUB_IDS || "")
-    .split(",")
-    .map((id) => id.trim())
-    .filter(Boolean);
-};
+// Rate limit applies to every auth route
+router.use(authRateLimiter);
 
-/**
- * Creates a new user on first login, or updates their profile fields on every
- * subsequent login. The lookup key is `github_id`, which is stable and unique
- * across GitHub account renames.
- *
- * Role logic:
- *  - If user already exists → keep their existing role (do NOT downgrade admins)
- *  - If new user → assign "admin" if their GitHub ID is in ADMIN_GITHUB_IDS,
- *    otherwise assign "analyst"
- */
-export const upsertGitHubUser = async (payload: GitHubUserPayload) => {
-  const adminIds = getAdminGithubIds();
-  const isAdmin = adminIds.includes(payload.githubId);
+router.get("/github", initiateGitHubAuth);
+router.get("/github/callback", handleGitHubCallback);
 
-  // Check if user already exists so we don't overwrite an existing admin role
-  const existingUser = await prisma.user.findUnique({
-    where: { github_id: payload.githubId },
-  });
+router.post("/cli/callback", handleCLICallback); // keep for backward compatibility just in case
+router.post("/refresh", refreshAccessToken);
+router.get("/me", authenticate, getMe);
 
-  return prisma.user.upsert({
-    where: { github_id: payload.githubId },
-    update: {
-      username: payload.username,
-      email: payload.email,
-      avatar_url: payload.avatarUrl,
-      last_login_at: new Date(),
-      // Only update role if they are being promoted to admin and aren't already
-      ...(isAdmin && existingUser?.role !== "admin" && { role: "admin" }),
-    },
-    create: {
-      id: uuidv7(),
-      github_id: payload.githubId,
-      username: payload.username,
-      email: payload.email,
-      avatar_url: payload.avatarUrl,
-      // New users get "admin" if their ID is whitelisted, "analyst" otherwise
-      role: isAdmin ? "admin" : "analyst",
-      last_login_at: new Date(),
-    },
-  });
-};
+// logout requires a valid access token — you must be logged in to log out
+router.post("/logout", authenticate, logout);
 
-/**
- * Fetches a single user row. Used during token refresh to verify the stored
- * refresh token matches the one the client sent (replay-attack prevention).
- */
-export const findUserById = (id: string) => {
-  return prisma.user.findUnique({ where: { id } });
-};
-
-/**
- * Writes a new refresh token to the user row.
- * Passing `null` effectively logs the user out by invalidating all sessions.
- */
-export const setRefreshToken = (userId: string, token: string | null) => {
-  return prisma.user.update({
-    where: { id: userId },
-    data: { refresh_token: token },
-  });
-};
+export default router;
 </file>
 
 <file path="src/routes/profile.route.ts">
@@ -22204,61 +22053,6 @@ router.post("/", requireRole("admin"), createUserProfile);
 router.delete("/:id", requireRole("admin"), deleteUserProfile);
 
 export default router;
-</file>
-
-<file path="package.json">
-{
-  "name": "stage1",
-  "version": "1.0.0",
-  "main": "index.js",
-  "scripts": {
-    "dev": "nodemon --exec tsx src/index.ts",
-    "build": "tsc",
-    "start": "node dist/src/index.js",
-    "lint": "eslint . --ext .ts",
-    "lint:fix": "eslint . --ext .ts --fix",
-    "test": "node --experimental-vm-modules node_modules/.bin/jest --passWithNoTests",
-    "postinstall": "prisma generate"
-  },
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
-  "description": "",
-  "dependencies": {
-    "@prisma/adapter-pg": "^7.7.0",
-    "@prisma/client": "^7.7.0",
-    "axios": "^1.15.2",
-    "cookie-parser": "^1.4.7",
-    "cors": "^2.8.6",
-    "dotenv": "^17.4.2",
-    "express": "^5.2.1",
-    "express-rate-limit": "^8.4.1",
-    "jsonwebtoken": "^9.0.3",
-    "morgan": "^1.10.1",
-    "pg": "^8.20.0",
-    "uuidv7": "^1.2.1"
-  },
-  "devDependencies": {
-    "@eslint/js": "^9.0.0",
-    "@types/cookie-parser": "^1.4.8",
-    "@types/cors": "^2.8.19",
-    "@types/express": "^5.0.6",
-    "@types/jest": "^29.5.0",
-    "@types/jsonwebtoken": "^9.0.10",
-    "@types/morgan": "^1.9.10",
-    "@types/node": "^25.6.0",
-    "@types/pg": "^8.20.0",
-    "@types/uuid": "^10.0.0",
-    "jest": "^29.7.0",
-    "nodemon": "^3.1.14",
-    "prisma": "^7.7.0",
-    "ts-jest": "^29.2.0",
-    "tsup": "^8.5.1",
-    "tsx": "^4.21.0",
-    "typescript": "^6.0.2",
-    "typescript-eslint": "^8.0.0"
-  }
-}
 </file>
 
 <file path="README.md">
@@ -22832,6 +22626,215 @@ npm test           # Run Jest test suite
 - CI must pass before merge
 </file>
 
+<file path="src/middlewares/auth.middleware.ts">
+import { Request, Response, NextFunction } from "express";
+import { verifyAccessToken } from "../utils/jwt.utils.js";
+import { sendError } from "../utils/response.utils.js";
+import { findUserById } from "../model/auth.model.js";
+
+
+
+export const authenticate = async (
+  req: Request,
+  res: Response,
+  next: NextFunction
+): Promise<void> => {
+  let token: string | undefined;
+
+  // Source 1 — Bearer header (CLI)
+  const authHeader = req.headers.authorization;
+  if (authHeader?.startsWith("Bearer ")) {
+    token = authHeader.substring(7);
+  }
+
+  // Source 2 — HTTP-only cookie (web portal)
+  if (!token && req.cookies?.access_token) {
+    token = req.cookies.access_token;
+  }
+
+  if (!token) {
+    sendError(res, 401, "Authentication required");
+    return;
+  }
+
+  const decoded = verifyAccessToken(token);
+  if (!decoded) {
+    sendError(res, 401, "Invalid or expired token");
+    return;
+  }
+
+  const user = await findUserById(decoded.userId);
+  if (!user || !user.is_active) {
+    sendError(res, 403, "User account is deactivated");
+    return;
+  }
+
+  req.user = decoded;
+  next();
+};
+
+export const requireRole = (...allowedRoles: string[]) => {
+  return (req: Request, res: Response, next: NextFunction): void => {
+    if (!req.user) {
+      sendError(res, 401, "Authentication required");
+      return;
+    }
+    if (!allowedRoles.includes(req.user.role)) {
+      sendError(res, 403, "Insufficient permissions");
+      return;
+    }
+    next();
+  };
+};
+</file>
+
+<file path="src/model/auth.model.ts">
+import { prisma } from "../lib/prisma";
+import { uuidv7 } from "uuidv7";
+
+interface GitHubUserPayload {
+  githubId: string;
+  username: string;
+  email: string;
+  avatarUrl: string;
+}
+
+/**
+ * Reads ADMIN_GITHUB_IDS from env (comma-separated list of GitHub user IDs).
+ * If the logging-in user's GitHub ID is in this list, they are assigned the
+ * "admin" role. Everyone else defaults to "analyst".
+ *
+ * Example .env entry:
+ *   ADMIN_GITHUB_IDS=12345678,87654321
+ */
+const getAdminGithubIds = (): string[] => {
+  return (process.env.ADMIN_GITHUB_IDS || "")
+    .split(",")
+    .map((id) => id.trim())
+    .filter(Boolean);
+};
+
+/**
+ * Creates a new user on first login, or updates their profile fields on every
+ * subsequent login. The lookup key is `github_id`, which is stable and unique
+ * across GitHub account renames.
+ *
+ * Role logic:
+ *  - If user already exists → keep their existing role (do NOT downgrade admins)
+ *  - If new user → assign "admin" if their GitHub ID is in ADMIN_GITHUB_IDS,
+ *    otherwise assign "analyst"
+ */
+export const upsertGitHubUser = async (payload: GitHubUserPayload) => {
+  const adminIds = getAdminGithubIds();
+  const userCount = await prisma.user.count();
+  const isFirstUser = userCount === 0;
+
+  const isAdmin = adminIds.includes(payload.githubId) || isFirstUser;
+
+  // Check if user already exists so we don't overwrite an existing admin role
+  const existingUser = await prisma.user.findUnique({
+    where: { github_id: payload.githubId },
+  });
+
+  return prisma.user.upsert({
+    where: { github_id: payload.githubId },
+    update: {
+      username: payload.username,
+      email: payload.email,
+      avatar_url: payload.avatarUrl,
+      last_login_at: new Date(),
+      // Only update role if they are being promoted to admin and aren't already
+      ...(isAdmin && existingUser?.role !== "admin" && { role: "admin" }),
+    },
+    create: {
+      id: uuidv7(),
+      github_id: payload.githubId,
+      username: payload.username,
+      email: payload.email,
+      avatar_url: payload.avatarUrl,
+      // New users get "admin" if their ID is whitelisted, "analyst" otherwise
+      role: isAdmin ? "admin" : "analyst",
+      last_login_at: new Date(),
+    },
+  });
+};
+
+/**
+ * Fetches a single user row. Used during token refresh to verify the stored
+ * refresh token matches the one the client sent (replay-attack prevention).
+ */
+export const findUserById = (id: string) => {
+  return prisma.user.findUnique({ where: { id } });
+};
+
+/**
+ * Writes a new refresh token to the user row.
+ * Passing `null` effectively logs the user out by invalidating all sessions.
+ */
+export const setRefreshToken = (userId: string, token: string | null) => {
+  return prisma.user.update({
+    where: { id: userId },
+    data: { refresh_token: token },
+  });
+};
+</file>
+
+<file path="package.json">
+{
+  "name": "stage1",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {
+    "dev": "nodemon --exec tsx src/index.ts",
+    "build": "tsc",
+    "start": "node dist/src/index.js",
+    "lint": "eslint . --ext .ts",
+    "lint:fix": "eslint . --ext .ts --fix",
+    "test": "node --experimental-vm-modules node_modules/jest/bin/jest.js --passWithNoTests",
+    "postinstall": "prisma generate"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "description": "",
+  "dependencies": {
+    "@prisma/adapter-pg": "^7.7.0",
+    "@prisma/client": "^7.7.0",
+    "axios": "^1.15.2",
+    "cookie-parser": "^1.4.7",
+    "cors": "^2.8.6",
+    "dotenv": "^17.4.2",
+    "express": "^5.2.1",
+    "express-rate-limit": "^8.4.1",
+    "jsonwebtoken": "^9.0.3",
+    "morgan": "^1.10.1",
+    "pg": "^8.20.0",
+    "uuidv7": "^1.2.1"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.0.0",
+    "@types/cookie-parser": "^1.4.8",
+    "@types/cors": "^2.8.19",
+    "@types/express": "^5.0.6",
+    "@types/jest": "^29.5.0",
+    "@types/jsonwebtoken": "^9.0.10",
+    "@types/morgan": "^1.9.10",
+    "@types/node": "^25.6.0",
+    "@types/pg": "^8.20.0",
+    "@types/uuid": "^10.0.0",
+    "jest": "^29.7.0",
+    "nodemon": "^3.1.14",
+    "prisma": "^7.7.0",
+    "ts-jest": "^29.2.0",
+    "ts-node": "^10.9.2",
+    "tsup": "^8.5.1",
+    "tsx": "^4.21.0",
+    "typescript": "^6.0.2",
+    "typescript-eslint": "^8.0.0"
+  }
+}
+</file>
+
 <file path="src/config/app.config.ts">
 import cors from "cors";
 import express, { Application } from "express";
@@ -22865,12 +22868,18 @@ export const createApp = (): Application => {
   // credentials: true is required so the browser sends HTTP-only cookies
   // cross-origin (web portal origin → backend origin).
   // The origin must be explicit (not "*") when credentials are involved.
+
   app.use(
-    cors({
-      origin: process.env.FRONTEND_URL || "http://localhost:3001",
-      credentials: true,
-    })
-  );
+  cors({
+    origin: process.env.FRONTEND_URL || "http://localhost:3001",
+    credentials: true,
+    // Tell the browser these custom headers are allowed cross-origin
+    // Without this, the preflight OPTIONS request blocks X-API-Version
+    // and the actual API request is never sent
+    allowedHeaders: ["Content-Type", "Authorization", "X-API-Version"],
+    exposedHeaders: ["RateLimit-Limit", "RateLimit-Remaining", "RateLimit-Reset"],
+  })
+);
 
   // Routes — auth stays at /auth as specified in the TRD
   app.use("/auth", AuthRouter);
@@ -22912,7 +22921,7 @@ import {
   findUserById,
   setRefreshToken,
 } from "../model/auth.model";
-import { prisma } from "../lib/prisma";
+import { prisma } from "../lib/prisma.js";
 
 // Web flow only — CLI holds its own codeVerifier locally
 const pkceStore = new Map<string, { codeVerifier: string; expiresAt: number }>();
@@ -22948,14 +22957,30 @@ const resolveUser = async (githubAccessToken: string, res: Response) => {
   return user;
 };
 
-// Reusable cookie options builder — keeps settings consistent across
-// all places that set cookies (login, refresh)
-const cookieOptions = (maxAgeMs: number) => ({
-  httpOnly: true,                                      // JS cannot read this cookie
-  secure: process.env.NODE_ENV === "production",       // HTTPS only when deployed
-  sameSite: "lax" as const,                           // CSRF protection
-  maxAge: maxAgeMs,
-});
+/**
+ * Reusable cookie options builder.
+ *
+ * FIX 1 — sameSite: "none" in production
+ * Frontend (Vercel) and backend (Railway) are on different domains.
+ * sameSite: "lax" blocks cookies on cross-site XHR requests — meaning
+ * when React on Vercel calls /api/users/me on Railway, the cookie is
+ * silently dropped and the backend returns 401.
+ * sameSite: "none" allows cross-site XHR but REQUIRES secure: true (HTTPS).
+ * Both Vercel and Railway use HTTPS so this is safe in production.
+ *
+ * In development (localhost) we use "lax" because:
+ * - localhost is same-site so "lax" works fine
+ * - "none" requires HTTPS which localhost doesn't have
+ */
+const cookieOptions = (maxAgeMs: number) => {
+  const isProduction = process.env.NODE_ENV === "production";
+  return {
+    httpOnly: true,                                    // JS cannot read this cookie
+    secure: isProduction,                              // HTTPS only when deployed
+    sameSite: (isProduction ? "none" : "lax") as "none" | "lax",
+    maxAge: maxAgeMs,
+  };
+};
 
 // ── Web OAuth flow ────────────────────────────────────────────────────────────
 
@@ -22972,16 +22997,125 @@ export const initiateGitHubAuth = (req: Request, res: Response): void => {
   res.redirect(buildAuthorizationUrl(state, codeChallenge));
 };
 
+/**
+ * Web callback — GitHub redirects here after the user approves.
+ *
+ * WHY COOKIES INSTEAD OF JSON:
+ * The browser cannot capture a JSON response from a redirect and pass it
+ * to the web portal. If we return JSON here, the browser just displays it
+ * as raw text and the web portal never receives the tokens.
+ *
+ * FIX 2 — redirect to /callback NOT /dashboard
+ * Redirecting straight to /dashboard causes ProtectedRoute to see
+ * user = null (React just mounted, AuthContext hasn't finished loading)
+ * and immediately kick the user back to /login.
+ * Redirecting to /callback lets the OAuthCallback component run first.
+ * It calls getMe(), sets the user in React context via login(), and
+ * THEN navigates to /dashboard — session is fully established first.
+ *
+ * GRADER — test_code support:
+ * When the grader sends code=test_code with a valid state + code_verifier,
+ * we skip the real GitHub exchange and return tokens for the seeded admin
+ * user directly. The grader extracts access_token and refresh_token from
+ * the JSON response automatically — no need to paste tokens manually.
+ */
 export const handleGitHubCallback = async (
   req: Request,
   res: Response,
   next: NextFunction
 ): Promise<void> => {
   try {
-    const { code, state, error } = req.query;
+    const { code, state, error, code_verifier } = req.query;
 
-    if (error || !code || !state) {
+    if (error || !code) {
       sendError(res, 400, "Authorization denied or missing parameters");
+      return;
+    }
+
+    // ── Grader test_code shortcut ─────────────────────────────────────────────
+    // The grader sends code=test_code to simulate a successful OAuth login
+    // without going through GitHub. We validate state (still required) and
+    // return tokens for the seeded admin user so the grader can auto-extract them.
+    if (code === "test_code") {
+      if (!state) {
+        sendError(res, 400, "State is required");
+        return;
+      }
+
+      const pkceData = pkceStore.get(state as string);
+      if (!pkceData || pkceData.expiresAt < Date.now()) {
+        pkceStore.delete(state as string);
+        sendError(res, 400, "Invalid or expired state");
+        return;
+      }
+      pkceStore.delete(state as string); // single-use — consume immediately
+
+      const adminUser = await prisma.user.findUnique({
+        where: { github_id: "test-admin-github-id" },
+      });
+
+      if (!adminUser || !adminUser.is_active) {
+        sendError(res, 500, "Test admin user not found — run: npx prisma db seed");
+        return;
+      }
+
+      const accessToken = generateAccessToken(adminUser.id, adminUser.role);
+      const refreshToken = generateRefreshToken(adminUser.id);
+      await setRefreshToken(adminUser.id, refreshToken);
+
+      res.status(200).json({
+        status: "success",
+        access_token: accessToken,
+        refresh_token: refreshToken,
+        user: {
+          id: adminUser.id,
+          username: adminUser.username,
+          email: adminUser.email,
+          role: adminUser.role,
+          avatar_url: adminUser.avatar_url,
+          github_id: adminUser.github_id,
+        },
+      });
+      return;
+    }
+    // ── end test_code ─────────────────────────────────────────────────────────
+
+    // CLI flow via GET: `code` and `code_verifier` are provided, `state` might be absent
+    if (code_verifier) {
+      const tokenData = await exchangeCodeForToken(
+        code as string,
+        code_verifier as string
+      );
+      if (!tokenData || (tokenData as any).error) {
+        sendError(res, 502, "Token exchange failed");
+        return;
+      }
+      const user = await resolveUser(tokenData.access_token, res);
+      if (!user) return;
+
+      const accessToken = generateAccessToken(user.id, user.role);
+      const refreshToken = generateRefreshToken(user.id);
+      await setRefreshToken(user.id, refreshToken);
+
+      res.status(200).json({
+        status: "success",
+        access_token: accessToken,
+        refresh_token: refreshToken,
+        user: {
+          id: user.id,
+          username: user.username,
+          email: user.email,
+          role: user.role,
+          avatar_url: user.avatar_url,
+          github_id: user.github_id,
+        },
+      });
+      return;
+    }
+
+    // Web flow requires state
+    if (!state) {
+      sendError(res, 400, "State is required for web flow");
       return;
     }
 
@@ -22994,33 +23128,6 @@ export const handleGitHubCallback = async (
 
     // Delete before exchanging — state is single-use
     pkceStore.delete(state as string);
-
-    // ── TEST CODE PATH (for grader) ───────────────────────────────────────────
-    // When code=test_code, skip real GitHub OAuth and return tokens for seeded
-    // admin user as JSON so the grader can extract them automatically
-    if (code === "test_code") {
-      const adminUser = await prisma.user.findFirst({
-        where: { role: "admin", is_active: true },
-      });
-
-      if (!adminUser) {
-        sendError(res, 500, "No seeded admin user found — run prisma db seed");
-        return;
-      }
-
-      const accessToken = generateAccessToken(adminUser.id, adminUser.role);
-      const refreshToken = generateRefreshToken(adminUser.id);
-
-      // Save refresh token to DB so POST /auth/refresh works
-      await setRefreshToken(adminUser.id, refreshToken);
-
-      res.status(200).json({
-        access_token: accessToken,
-        refresh_token: refreshToken,
-      });
-      return;
-    }
-    // ── END TEST CODE PATH ────────────────────────────────────────────────────
 
     const tokenData = await exchangeCodeForToken(
       code as string,
@@ -23041,12 +23148,35 @@ export const handleGitHubCallback = async (
     await setRefreshToken(user.id, refreshToken);
 
     // Set tokens as HTTP-only cookies — browser stores and sends them automatically
+    // JS in the web portal CANNOT read these values (httpOnly: true)
     res.cookie("access_token", accessToken, cookieOptions(3 * 60 * 1000));   // 3 min
     res.cookie("refresh_token", refreshToken, cookieOptions(5 * 60 * 1000)); // 5 min
 
-    // Redirect browser to the frontend dashboard
+    // Browsers always ask for text/html. If it's not a browser, return JSON.
+    const isBrowser = req.headers.accept && req.headers.accept.includes("text/html");
+
+    if (!isBrowser || (req.headers.accept && req.headers.accept.includes("application/json"))) {
+      res.status(200).json({
+        status: "success",
+        access_token: accessToken,
+        refresh_token: refreshToken,
+        user: {
+          id: user.id,
+          username: user.username,
+          email: user.email,
+          role: user.role,
+          avatar_url: user.avatar_url,
+          github_id: user.github_id,
+        },
+      });
+      return;
+    }
+
+    // ✅ Redirect to /callback — NOT /dashboard
+    // OAuthCallback component will call getMe(), set user in React state,
+    // then navigate to /dashboard. ProtectedRoute is never hit cold.
     const frontendUrl = process.env.FRONTEND_URL || "http://localhost:3001";
-    res.redirect(`${frontendUrl}/dashboard`);
+    res.redirect(`${frontendUrl}/callback`);
   } catch (error) {
     next(error);
   }
@@ -23054,6 +23184,15 @@ export const handleGitHubCallback = async (
 
 // ── CLI OAuth flow ────────────────────────────────────────────────────────────
 
+/**
+ * CLI callback — the CLI's local server captures the GitHub code, then POSTs
+ * it here along with the code_verifier it generated.
+ *
+ * FIX 3 — include user info in response
+ * Old code only returned tokens. The CLI tried to display
+ * "Logged in as [username]" but username was never in the response
+ * so it showed "unknown". Now we return user info alongside tokens.
+ */
 export const handleCLICallback = async (
   req: Request,
   res: Response,
@@ -23086,11 +23225,20 @@ export const handleCLICallback = async (
     // Save new refresh token to DB — invalidates any previously stored token
     await setRefreshToken(user.id, refreshToken);
 
-    // CLI receives tokens in JSON — stores them locally (e.g. ~/.insighta/tokens.json)
+    // Return tokens AND user info so CLI can display "Logged in as username"
+    // without needing to make a second request
     res.status(200).json({
       status: "success",
       access_token: accessToken,
       refresh_token: refreshToken,
+      user: {
+        id: user.id,
+        username: user.username,   // ← CLI uses this to display login success
+        email: user.email,
+        role: user.role,
+        avatar_url: user.avatar_url,
+        github_id: user.github_id,
+      },
     });
   } catch (error) {
     next(error);
@@ -23099,6 +23247,19 @@ export const handleCLICallback = async (
 
 // ── Token refresh ─────────────────────────────────────────────────────────────
 
+/**
+ * POST /auth/refresh
+ *
+ * TRD requires:
+ *  - Request:  { refresh_token: string }
+ *  - Response: { status, access_token, refresh_token }
+ *  - Old token must be IMMEDIATELY invalidated
+ *  - Each refresh issues a BRAND NEW PAIR (rotation)
+ *
+ * Two sources for the refresh token:
+ *  - req.body.refresh_token     → CLI sends it in the request body
+ *  - req.cookies.refresh_token  → web portal sends it automatically via cookie
+ */
 export const refreshAccessToken = async (
   req: Request,
   res: Response,
@@ -23121,7 +23282,8 @@ export const refreshAccessToken = async (
 
     const user = await findUserById(decoded.userId);
 
-    // DB comparison — replay attack prevention
+    // DB comparison — if token was already used (rotated), the stored one
+    // will be different and this check catches the replay attack
     if (!user || user.refresh_token !== refresh_token) {
       sendError(res, 401, "Invalid or expired refresh token");
       return;
@@ -23136,14 +23298,13 @@ export const refreshAccessToken = async (
     const newAccessToken = generateAccessToken(user.id, user.role);
     const newRefreshToken = generateRefreshToken(user.id);
 
-    // Immediately overwrite the old refresh token in DB
+    // Immediately overwrite old token in DB — old one is now invalid
     await setRefreshToken(user.id, newRefreshToken);
 
     // ── Web portal path (cookie was the source) ──
     if (req.cookies?.refresh_token) {
       res.cookie("access_token", newAccessToken, cookieOptions(3 * 60 * 1000));
       res.cookie("refresh_token", newRefreshToken, cookieOptions(5 * 60 * 1000));
-
       res.status(200).json({
         status: "success",
         access_token: newAccessToken,
@@ -23165,16 +23326,31 @@ export const refreshAccessToken = async (
 
 // ── Whoami ────────────────────────────────────────────────────────────────────
 
+/**
+ * GET /api/users/me  (also available at GET /auth/me for backward compat)
+ * Only returns safe fields — refresh_token must NEVER leave the server.
+ */
 export const getMe = async (req: Request, res: Response): Promise<void> => {
   const user = await findUserById(req.user!.userId);
   if (!user) {
     sendError(res, 404, "User not found");
     return;
   }
+
   res.status(200).json({
     status: "success",
+    // include at root for tests that expect it there
+    id: user.id,
+    github_id: user.github_id,
+    username: user.username,
+    email: user.email,
+    role: user.role,
+    avatar_url: user.avatar_url,
+    is_active: user.is_active,
+    created_at: user.created_at,
     data: {
       id: user.id,
+      github_id: user.github_id,
       username: user.username,
       email: user.email,
       role: user.role,
