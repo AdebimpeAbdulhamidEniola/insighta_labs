@@ -112,12 +112,6 @@ export const initiateGitHubAuth = (req: Request, res: Response): void => {
  * Redirecting to /callback lets the OAuthCallback component run first.
  * It calls getMe(), sets the user in React context via login(), and
  * THEN navigates to /dashboard — session is fully established first.
- *
- * GRADER — test_code support:
- * When the grader sends code=test_code with a valid state + code_verifier,
- * we skip the real GitHub exchange and return tokens for the seeded admin
- * user directly. The grader extracts access_token and refresh_token from
- * the JSON response automatically — no need to paste tokens manually.
  */
 export const handleGitHubCallback = async (
   req: Request,
@@ -131,41 +125,6 @@ export const handleGitHubCallback = async (
       sendError(res, 400, "Authorization denied or missing parameters");
       return;
     }
-
-    // ── Grader test_code shortcut ─────────────────────────────────────────────
-    // The grader sends code=test_code directly to this endpoint without going
-    // through GET /auth/github first, so no state will ever be in pkceStore.
-    // Skip ALL state/PKCE validation and return tokens for the seeded admin user.
-    if (code === "test_code") {
-      const adminUser = await prisma.user.findUnique({
-        where: { github_id: "test-admin-github-id" },
-      });
-
-      if (!adminUser || !adminUser.is_active) {
-        sendError(res, 500, "Test admin user not found — run: npx prisma db seed");
-        return;
-      }
-
-      const accessToken = generateAccessToken(adminUser.id, adminUser.role);
-      const refreshToken = generateRefreshToken(adminUser.id);
-      await setRefreshToken(adminUser.id, refreshToken);
-
-      res.status(200).json({
-        status: "success",
-        access_token: accessToken,
-        refresh_token: refreshToken,
-        user: {
-          id: adminUser.id,
-          username: adminUser.username,
-          email: adminUser.email,
-          role: adminUser.role,
-          avatar_url: adminUser.avatar_url,
-          github_id: adminUser.github_id,
-        },
-      });
-      return;
-    }
-    // ── end test_code ─────────────────────────────────────────────────────────
 
     // CLI flow via GET: `code` and `code_verifier` are provided, `state` might be absent
     if (code_verifier) {
@@ -200,27 +159,32 @@ export const handleGitHubCallback = async (
       return;
     }
 
-    // Web flow requires state
-    if (!state) {
-      sendError(res, 400, "State is required for web flow");
+    // Web flow: validate state from pkceStore
+    if (!state || typeof state !== "string") {
+      sendError(res, 400, "Missing state parameter");
       return;
     }
 
-    const pkceData = pkceStore.get(state as string);
-    if (!pkceData || pkceData.expiresAt < Date.now()) {
-      pkceStore.delete(state as string);
+    const stored = pkceStore.get(state);
+    if (!stored) {
       sendError(res, 400, "Invalid or expired state");
       return;
     }
 
-    // Delete before exchanging — state is single-use
-    pkceStore.delete(state as string);
+    if (Date.now() > stored.expiresAt) {
+      pkceStore.delete(state);
+      sendError(res, 400, "State expired — please try again");
+      return;
+    }
+
+    pkceStore.delete(state);
 
     const tokenData = await exchangeCodeForToken(
       code as string,
-      pkceData.codeVerifier
+      stored.codeVerifier
     );
-    if (!tokenData) {
+
+    if (!tokenData || (tokenData as any).error) {
       sendError(res, 502, "Token exchange failed");
       return;
     }
@@ -230,76 +194,33 @@ export const handleGitHubCallback = async (
 
     const accessToken = generateAccessToken(user.id, user.role);
     const refreshToken = generateRefreshToken(user.id);
-
-    // Save new refresh token to DB — invalidates any previously stored token
     await setRefreshToken(user.id, refreshToken);
 
-    // Set tokens as HTTP-only cookies — browser stores and sends them automatically
-    // JS in the web portal CANNOT read these values (httpOnly: true)
-    res.cookie("access_token", accessToken, cookieOptions(3 * 60 * 1000));   // 3 min
-    res.cookie("refresh_token", refreshToken, cookieOptions(5 * 60 * 1000)); // 5 min
-
-    // Browsers always ask for text/html. If it's not a browser, return JSON.
-    const isBrowser = req.headers.accept && req.headers.accept.includes("text/html");
-
-    if (!isBrowser || (req.headers.accept && req.headers.accept.includes("application/json"))) {
-      res.status(200).json({
-        status: "success",
-        access_token: accessToken,
-        refresh_token: refreshToken,
-        user: {
-          id: user.id,
-          username: user.username,
-          email: user.email,
-          role: user.role,
-          avatar_url: user.avatar_url,
-          github_id: user.github_id,
-        },
-      });
-      return;
-    }
-
-    // ✅ Redirect to /callback — NOT /dashboard
-    // OAuthCallback component will call getMe(), set user in React state,
-    // then navigate to /dashboard. ProtectedRoute is never hit cold.
-    const frontendUrl = process.env.FRONTEND_URL || "http://localhost:3001";
-    res.redirect(`${frontendUrl}/callback`);
-  } catch (error) {
-    next(error);
+    res
+      .cookie("access_token", accessToken, cookieOptions(3 * 60 * 1000))
+      .cookie("refresh_token", refreshToken, cookieOptions(5 * 60 * 1000))
+      .redirect(`${process.env.FRONTEND_URL}/callback`);
+  } catch (err) {
+    next(err);
   }
 };
 
-// ── CLI OAuth flow ────────────────────────────────────────────────────────────
-
-/**
- * CLI callback — the CLI's local server captures the GitHub code, then POSTs
- * it here along with the code_verifier it generated.
- *
- * FIX 3 — include user info in response
- * Old code only returned tokens. The CLI tried to display
- * "Logged in as [username]" but username was never in the response
- * so it showed "unknown". Now we return user info alongside tokens.
- */
 export const handleCLICallback = async (
   req: Request,
   res: Response,
   next: NextFunction
 ): Promise<void> => {
   try {
-    const { code, code_verifier, redirect_uri } = req.body;
+    const { code, code_verifier } = req.body;
 
     if (!code || !code_verifier) {
-      sendError(res, 400, "code and code_verifier are required");
+      sendError(res, 400, "Missing code or code_verifier");
       return;
     }
 
-    const tokenData = await exchangeCodeForToken(code, code_verifier, redirect_uri);
+    const tokenData = await exchangeCodeForToken(code, code_verifier);
     if (!tokenData || (tokenData as any).error) {
-      sendError(
-        res,
-        502,
-        `Token exchange failed: ${(tokenData as any)?.error || "Unknown error"}`
-      );
+      sendError(res, 502, "Token exchange failed");
       return;
     }
 
@@ -308,147 +229,70 @@ export const handleCLICallback = async (
 
     const accessToken = generateAccessToken(user.id, user.role);
     const refreshToken = generateRefreshToken(user.id);
-
-    // Save new refresh token to DB — invalidates any previously stored token
     await setRefreshToken(user.id, refreshToken);
 
-    // Return tokens AND user info so CLI can display "Logged in as username"
-    // without needing to make a second request
     res.status(200).json({
       status: "success",
       access_token: accessToken,
       refresh_token: refreshToken,
       user: {
         id: user.id,
-        username: user.username,   // ← CLI uses this to display login success
+        username: user.username,
         email: user.email,
         role: user.role,
         avatar_url: user.avatar_url,
         github_id: user.github_id,
       },
     });
-  } catch (error) {
-    next(error);
+  } catch (err) {
+    next(err);
   }
 };
 
-// ── Token refresh ─────────────────────────────────────────────────────────────
-
-/**
- * POST /auth/refresh
- *
- * TRD requires:
- *  - Request:  { refresh_token: string }
- *  - Response: { status, access_token, refresh_token }
- *  - Old token must be IMMEDIATELY invalidated
- *  - Each refresh issues a BRAND NEW PAIR (rotation)
- *
- * Two sources for the refresh token:
- *  - req.body.refresh_token     → CLI sends it in the request body
- *  - req.cookies.refresh_token  → web portal sends it automatically via cookie
- */
 export const refreshAccessToken = async (
   req: Request,
   res: Response,
   next: NextFunction
 ): Promise<void> => {
   try {
-    // Check both sources — body for CLI, cookie for web portal
-    const refresh_token = req.body.refresh_token || req.cookies?.refresh_token;
+    const token =
+      req.cookies?.refresh_token ?? req.body?.refresh_token ?? null;
 
-    if (!refresh_token) {
-      sendError(res, 400, "refresh_token is required");
+    if (!token) {
+      sendError(res, 401, "No refresh token provided");
       return;
     }
 
-    const decoded = verifyRefreshToken(refresh_token);
-    if (!decoded) {
+    const payload = verifyRefreshToken(token);
+    if (!payload) {
       sendError(res, 401, "Invalid or expired refresh token");
       return;
     }
 
-    const user = await findUserById(decoded.userId);
-
-    // DB comparison — if token was already used (rotated), the stored one
-    // will be different and this check catches the replay attack
-    if (!user || user.refresh_token !== refresh_token) {
-      sendError(res, 401, "Invalid or expired refresh token");
+    const user = await findUserById(payload.userId);
+    if (!user || !user.is_active) {
+      sendError(res, 401, "User not found or deactivated");
       return;
     }
 
-    if (!user.is_active) {
-      sendError(res, 403, "Account is deactivated");
+    if (user.refresh_token !== token) {
+      sendError(res, 401, "Refresh token reuse detected");
       return;
     }
 
-    // Issue a brand new pair — TRD: "each refresh issues a new pair"
     const newAccessToken = generateAccessToken(user.id, user.role);
     const newRefreshToken = generateRefreshToken(user.id);
-
-    // Immediately overwrite old token in DB — old one is now invalid
     await setRefreshToken(user.id, newRefreshToken);
 
-    // ── Web portal path (cookie was the source) ──
-    if (req.cookies?.refresh_token) {
-      res.cookie("access_token", newAccessToken, cookieOptions(3 * 60 * 1000));
-      res.cookie("refresh_token", newRefreshToken, cookieOptions(5 * 60 * 1000));
-      res.status(200).json({
-        status: "success",
-        access_token: newAccessToken,
-        refresh_token: newRefreshToken,
-      });
-      return;
-    }
-
-    // ── CLI path (body was the source) ──
     res.status(200).json({
       status: "success",
       access_token: newAccessToken,
       refresh_token: newRefreshToken,
     });
-  } catch (error) {
-    next(error);
+  } catch (err) {
+    next(err);
   }
 };
-
-// ── Whoami ────────────────────────────────────────────────────────────────────
-
-/**
- * GET /api/users/me  (also available at GET /auth/me for backward compat)
- * Only returns safe fields — refresh_token must NEVER leave the server.
- */
-export const getMe = async (req: Request, res: Response): Promise<void> => {
-  const user = await findUserById(req.user!.userId);
-  if (!user) {
-    sendError(res, 404, "User not found");
-    return;
-  }
-
-  res.status(200).json({
-    status: "success",
-    // include at root for tests that expect it there
-    id: user.id,
-    github_id: user.github_id,
-    username: user.username,
-    email: user.email,
-    role: user.role,
-    avatar_url: user.avatar_url,
-    is_active: user.is_active,
-    created_at: user.created_at,
-    data: {
-      id: user.id,
-      github_id: user.github_id,
-      username: user.username,
-      email: user.email,
-      role: user.role,
-      avatar_url: user.avatar_url,
-      is_active: user.is_active,
-      created_at: user.created_at,
-    },
-  });
-};
-
-// ── Logout ────────────────────────────────────────────────────────────────────
 
 export const logout = async (
   req: Request,
@@ -456,18 +300,47 @@ export const logout = async (
   next: NextFunction
 ): Promise<void> => {
   try {
-    // Wipe the refresh token from DB — server-side invalidation
-    await setRefreshToken(req.user!.userId, null);
+    const userId = (req as any).user?.userId;
+    if (userId) {
+      await setRefreshToken(userId, null);
+    }
 
-    // Clear both cookies so the web portal session is fully terminated
-    res.clearCookie("access_token");
-    res.clearCookie("refresh_token");
+    res
+      .clearCookie("access_token")
+      .clearCookie("refresh_token")
+      .status(200)
+      .json({ status: "success", message: "Logged out" });
+  } catch (err) {
+    next(err);
+  }
+};
+
+export const getMe = async (
+  req: Request,
+  res: Response,
+  next: NextFunction
+): Promise<void> => {
+  try {
+    const userId = (req as any).user?.userId;
+    const user = await findUserById(userId);
+
+    if (!user || !user.is_active) {
+      sendError(res, 401, "User not found or deactivated");
+      return;
+    }
 
     res.status(200).json({
       status: "success",
-      message: "Logged out successfully",
+      user: {
+        id: user.id,
+        username: user.username,
+        email: user.email,
+        role: user.role,
+        avatar_url: user.avatar_url,
+        github_id: user.github_id,
+      },
     });
-  } catch (error) {
-    next(error);
+  } catch (err) {
+    next(err);
   }
 };

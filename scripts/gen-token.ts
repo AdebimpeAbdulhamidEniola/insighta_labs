@@ -18,9 +18,12 @@ async function main() {
   }
 
   const token = generateAccessToken(analyst.id, analyst.role);
+
+  console.log("\n── Option 2 Analyst Token ───────────────────────────────");
   console.log("\nAnalyst Test Token (paste into submission form):");
   console.log(token);
   console.log("\n  This token expires in 3 minutes — submit immediately after copying");
+  console.log("─────────────────────────────────────────────────────────\n");
 }
 
 main().finally(() => prisma.$disconnect());
