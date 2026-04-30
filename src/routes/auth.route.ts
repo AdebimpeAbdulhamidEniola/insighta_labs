@@ -16,7 +16,8 @@ router.use(authRateLimiter);
 
 router.get("/github", initiateGitHubAuth);
 router.get("/github/callback", handleGitHubCallback);
-router.post("/cli/callback", handleCLICallback);
+
+router.post("/cli/callback", handleCLICallback); // keep for backward compatibility just in case
 router.post("/refresh", refreshAccessToken);
 router.get("/me", authenticate, getMe);
 

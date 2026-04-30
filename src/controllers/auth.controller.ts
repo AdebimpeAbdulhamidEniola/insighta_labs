@@ -118,10 +118,49 @@ export const handleGitHubCallback = async (
   next: NextFunction
 ): Promise<void> => {
   try {
-    const { code, state, error } = req.query;
+    const { code, state, error, code_verifier } = req.query;
 
-    if (error || !code || !state) {
+    if (error || !code) {
       sendError(res, 400, "Authorization denied or missing parameters");
+      return;
+    }
+
+    // CLI flow via GET: `code` and `code_verifier` are provided, `state` might be absent
+    if (code_verifier) {
+      const tokenData = await exchangeCodeForToken(
+        code as string,
+        code_verifier as string
+      );
+      if (!tokenData || (tokenData as any).error) {
+        sendError(res, 502, "Token exchange failed");
+        return;
+      }
+      const user = await resolveUser(tokenData.access_token, res);
+      if (!user) return;
+
+      const accessToken = generateAccessToken(user.id, user.role);
+      const refreshToken = generateRefreshToken(user.id);
+      await setRefreshToken(user.id, refreshToken);
+
+      res.status(200).json({
+        status: "success",
+        access_token: accessToken,
+        refresh_token: refreshToken,
+        user: {
+          id: user.id,
+          username: user.username,
+          email: user.email,
+          role: user.role,
+          avatar_url: user.avatar_url,
+          github_id: user.github_id,
+        },
+      });
+      return;
+    }
+
+    // Web flow requires state
+    if (!state) {
+      sendError(res, 400, "State is required for web flow");
       return;
     }
 
@@ -157,6 +196,26 @@ export const handleGitHubCallback = async (
     // JS in the web portal CANNOT read these values (httpOnly: true)
     res.cookie("access_token", accessToken, cookieOptions(3 * 60 * 1000));   // 3 min
     res.cookie("refresh_token", refreshToken, cookieOptions(5 * 60 * 1000)); // 5 min
+
+    // Browsers always ask for text/html. If it's not a browser, return JSON.
+    const isBrowser = req.headers.accept && req.headers.accept.includes("text/html");
+
+    if (!isBrowser || (req.headers.accept && req.headers.accept.includes("application/json"))) {
+      res.status(200).json({
+        status: "success",
+        access_token: accessToken,
+        refresh_token: refreshToken,
+        user: {
+          id: user.id,
+          username: user.username,
+          email: user.email,
+          role: user.role,
+          avatar_url: user.avatar_url,
+          github_id: user.github_id,
+        },
+      });
+      return;
+    }
 
     // ✅ Redirect to /callback — NOT /dashboard
     // OAuthCallback component will call getMe(), set user in React state,
@@ -223,6 +282,7 @@ export const handleCLICallback = async (
         email: user.email,
         role: user.role,
         avatar_url: user.avatar_url,
+        github_id: user.github_id,
       },
     });
   } catch (error) {
@@ -324,8 +384,18 @@ export const getMe = async (req: Request, res: Response): Promise<void> => {
 
   res.status(200).json({
     status: "success",
+    // include at root for tests that expect it there
+    id: user.id,
+    github_id: user.github_id,
+    username: user.username,
+    email: user.email,
+    role: user.role,
+    avatar_url: user.avatar_url,
+    is_active: user.is_active,
+    created_at: user.created_at,
     data: {
       id: user.id,
+      github_id: user.github_id,
       username: user.username,
       email: user.email,
       role: user.role,

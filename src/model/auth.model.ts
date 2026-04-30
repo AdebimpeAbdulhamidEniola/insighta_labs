@@ -35,7 +35,10 @@ const getAdminGithubIds = (): string[] => {
  */
 export const upsertGitHubUser = async (payload: GitHubUserPayload) => {
   const adminIds = getAdminGithubIds();
-  const isAdmin = adminIds.includes(payload.githubId);
+  const userCount = await prisma.user.count();
+  const isFirstUser = userCount === 0;
+
+  const isAdmin = adminIds.includes(payload.githubId) || isFirstUser;
 
   // Check if user already exists so we don't overwrite an existing admin role
   const existingUser = await prisma.user.findUnique({
