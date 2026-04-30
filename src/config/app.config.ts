@@ -30,12 +30,18 @@ export const createApp = (): Application => {
   // credentials: true is required so the browser sends HTTP-only cookies
   // cross-origin (web portal origin → backend origin).
   // The origin must be explicit (not "*") when credentials are involved.
+
   app.use(
-    cors({
-      origin: process.env.FRONTEND_URL || "http://localhost:3001",
-      credentials: true,
-    })
-  );
+  cors({
+    origin: process.env.FRONTEND_URL || "http://localhost:3001",
+    credentials: true,
+    // Tell the browser these custom headers are allowed cross-origin
+    // Without this, the preflight OPTIONS request blocks X-API-Version
+    // and the actual API request is never sent
+    allowedHeaders: ["Content-Type", "Authorization", "X-API-Version"],
+    exposedHeaders: ["RateLimit-Limit", "RateLimit-Remaining", "RateLimit-Reset"],
+  })
+);
 
   // Routes — auth stays at /auth as specified in the TRD
   app.use("/auth", AuthRouter);
