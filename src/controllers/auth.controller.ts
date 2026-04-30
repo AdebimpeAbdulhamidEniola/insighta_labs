@@ -21,7 +21,6 @@ import {
   findUserById,
   setRefreshToken,
 } from "../model/auth.model";
-import { prisma } from "../lib/prisma";
 
 // Web flow only — CLI holds its own codeVerifier locally
 const pkceStore = new Map<string, { codeVerifier: string; expiresAt: number }>();
@@ -57,14 +56,30 @@ const resolveUser = async (githubAccessToken: string, res: Response) => {
   return user;
 };
 
-// Reusable cookie options builder — keeps settings consistent across
-// all places that set cookies (login, refresh)
-const cookieOptions = (maxAgeMs: number) => ({
-  httpOnly: true,                                      // JS cannot read this cookie
-  secure: process.env.NODE_ENV === "production",       // HTTPS only when deployed
-  sameSite: "lax" as const,                           // CSRF protection
-  maxAge: maxAgeMs,
-});
+/**
+ * Reusable cookie options builder.
+ *
+ * FIX 1 — sameSite: "none" in production
+ * Frontend (Vercel) and backend (Railway) are on different domains.
+ * sameSite: "lax" blocks cookies on cross-site XHR requests — meaning
+ * when React on Vercel calls /api/users/me on Railway, the cookie is
+ * silently dropped and the backend returns 401.
+ * sameSite: "none" allows cross-site XHR but REQUIRES secure: true (HTTPS).
+ * Both Vercel and Railway use HTTPS so this is safe in production.
+ *
+ * In development (localhost) we use "lax" because:
+ * - localhost is same-site so "lax" works fine
+ * - "none" requires HTTPS which localhost doesn't have
+ */
+const cookieOptions = (maxAgeMs: number) => {
+  const isProduction = process.env.NODE_ENV === "production";
+  return {
+    httpOnly: true,                                    // JS cannot read this cookie
+    secure: isProduction,                              // HTTPS only when deployed
+    sameSite: (isProduction ? "none" : "lax") as "none" | "lax",
+    maxAge: maxAgeMs,
+  };
+};
 
 // ── Web OAuth flow ────────────────────────────────────────────────────────────
 
@@ -81,6 +96,22 @@ export const initiateGitHubAuth = (req: Request, res: Response): void => {
   res.redirect(buildAuthorizationUrl(state, codeChallenge));
 };
 
+/**
+ * Web callback — GitHub redirects here after the user approves.
+ *
+ * WHY COOKIES INSTEAD OF JSON:
+ * The browser cannot capture a JSON response from a redirect and pass it
+ * to the web portal. If we return JSON here, the browser just displays it
+ * as raw text and the web portal never receives the tokens.
+ *
+ * FIX 2 — redirect to /callback NOT /dashboard
+ * Redirecting straight to /dashboard causes ProtectedRoute to see
+ * user = null (React just mounted, AuthContext hasn't finished loading)
+ * and immediately kick the user back to /login.
+ * Redirecting to /callback lets the OAuthCallback component run first.
+ * It calls getMe(), sets the user in React context via login(), and
+ * THEN navigates to /dashboard — session is fully established first.
+ */
 export const handleGitHubCallback = async (
   req: Request,
   res: Response,
@@ -104,33 +135,6 @@ export const handleGitHubCallback = async (
     // Delete before exchanging — state is single-use
     pkceStore.delete(state as string);
 
-    // ── TEST CODE PATH (for grader) ───────────────────────────────────────────
-    // When code=test_code, skip real GitHub OAuth and return tokens for seeded
-    // admin user as JSON so the grader can extract them automatically
-    if (code === "test_code") {
-      const adminUser = await prisma.user.findFirst({
-        where: { role: "admin", is_active: true },
-      });
-
-      if (!adminUser) {
-        sendError(res, 500, "No seeded admin user found — run prisma db seed");
-        return;
-      }
-
-      const accessToken = generateAccessToken(adminUser.id, adminUser.role);
-      const refreshToken = generateRefreshToken(adminUser.id);
-
-      // Save refresh token to DB so POST /auth/refresh works
-      await setRefreshToken(adminUser.id, refreshToken);
-
-      res.status(200).json({
-        access_token: accessToken,
-        refresh_token: refreshToken,
-      });
-      return;
-    }
-    // ── END TEST CODE PATH ────────────────────────────────────────────────────
-
     const tokenData = await exchangeCodeForToken(
       code as string,
       pkceData.codeVerifier
@@ -150,10 +154,13 @@ export const handleGitHubCallback = async (
     await setRefreshToken(user.id, refreshToken);
 
     // Set tokens as HTTP-only cookies — browser stores and sends them automatically
+    // JS in the web portal CANNOT read these values (httpOnly: true)
     res.cookie("access_token", accessToken, cookieOptions(3 * 60 * 1000));   // 3 min
     res.cookie("refresh_token", refreshToken, cookieOptions(5 * 60 * 1000)); // 5 min
 
-    // Redirect browser to the frontend dashboard
+    // ✅ Redirect to /callback — NOT /dashboard
+    // OAuthCallback component will call getMe(), set user in React state,
+    // then navigate to /dashboard. ProtectedRoute is never hit cold.
     const frontendUrl = process.env.FRONTEND_URL || "http://localhost:3001";
     res.redirect(`${frontendUrl}/callback`);
   } catch (error) {
@@ -163,6 +170,15 @@ export const handleGitHubCallback = async (
 
 // ── CLI OAuth flow ────────────────────────────────────────────────────────────
 
+/**
+ * CLI callback — the CLI's local server captures the GitHub code, then POSTs
+ * it here along with the code_verifier it generated.
+ *
+ * FIX 3 — include user info in response
+ * Old code only returned tokens. The CLI tried to display
+ * "Logged in as [username]" but username was never in the response
+ * so it showed "unknown". Now we return user info alongside tokens.
+ */
 export const handleCLICallback = async (
   req: Request,
   res: Response,
@@ -195,11 +211,19 @@ export const handleCLICallback = async (
     // Save new refresh token to DB — invalidates any previously stored token
     await setRefreshToken(user.id, refreshToken);
 
-    // CLI receives tokens in JSON — stores them locally (e.g. ~/.insighta/tokens.json)
+    // Return tokens AND user info so CLI can display "Logged in as username"
+    // without needing to make a second request
     res.status(200).json({
       status: "success",
       access_token: accessToken,
       refresh_token: refreshToken,
+      user: {
+        id: user.id,
+        username: user.username,   // ← CLI uses this to display login success
+        email: user.email,
+        role: user.role,
+        avatar_url: user.avatar_url,
+      },
     });
   } catch (error) {
     next(error);
@@ -208,6 +232,19 @@ export const handleCLICallback = async (
 
 // ── Token refresh ─────────────────────────────────────────────────────────────
 
+/**
+ * POST /auth/refresh
+ *
+ * TRD requires:
+ *  - Request:  { refresh_token: string }
+ *  - Response: { status, access_token, refresh_token }
+ *  - Old token must be IMMEDIATELY invalidated
+ *  - Each refresh issues a BRAND NEW PAIR (rotation)
+ *
+ * Two sources for the refresh token:
+ *  - req.body.refresh_token     → CLI sends it in the request body
+ *  - req.cookies.refresh_token  → web portal sends it automatically via cookie
+ */
 export const refreshAccessToken = async (
   req: Request,
   res: Response,
@@ -230,7 +267,8 @@ export const refreshAccessToken = async (
 
     const user = await findUserById(decoded.userId);
 
-    // DB comparison — replay attack prevention
+    // DB comparison — if token was already used (rotated), the stored one
+    // will be different and this check catches the replay attack
     if (!user || user.refresh_token !== refresh_token) {
       sendError(res, 401, "Invalid or expired refresh token");
       return;
@@ -245,14 +283,13 @@ export const refreshAccessToken = async (
     const newAccessToken = generateAccessToken(user.id, user.role);
     const newRefreshToken = generateRefreshToken(user.id);
 
-    // Immediately overwrite the old refresh token in DB
+    // Immediately overwrite old token in DB — old one is now invalid
     await setRefreshToken(user.id, newRefreshToken);
 
     // ── Web portal path (cookie was the source) ──
     if (req.cookies?.refresh_token) {
       res.cookie("access_token", newAccessToken, cookieOptions(3 * 60 * 1000));
       res.cookie("refresh_token", newRefreshToken, cookieOptions(5 * 60 * 1000));
-
       res.status(200).json({
         status: "success",
         access_token: newAccessToken,
@@ -274,12 +311,17 @@ export const refreshAccessToken = async (
 
 // ── Whoami ────────────────────────────────────────────────────────────────────
 
+/**
+ * GET /api/users/me  (also available at GET /auth/me for backward compat)
+ * Only returns safe fields — refresh_token must NEVER leave the server.
+ */
 export const getMe = async (req: Request, res: Response): Promise<void> => {
   const user = await findUserById(req.user!.userId);
   if (!user) {
     sendError(res, 404, "User not found");
     return;
   }
+
   res.status(200).json({
     status: "success",
     data: {
