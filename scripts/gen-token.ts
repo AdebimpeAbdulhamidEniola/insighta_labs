@@ -8,12 +8,17 @@ const adapter = new PrismaPg({ connectionString });
 const prisma = new PrismaClient({ adapter });
 
 async function main() {
-  const analyst = await prisma.user.findFirst({
-    where: { role: "analyst", is_active: true },
+  const analyst = await prisma.user.findUnique({
+    where: { github_id: "test-analyst-github-id" },
   });
 
   if (!analyst) {
-    console.log("No analyst user found — run: npx prisma db seed");
+    console.log("No seeded analyst user found — run: npx prisma db seed");
+    return;
+  }
+
+  if (!analyst.is_active) {
+    console.log("Seeded analyst user is deactivated — check your DB");
     return;
   }
 
