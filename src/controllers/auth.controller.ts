@@ -21,7 +21,6 @@ import {
   findUserById,
   setRefreshToken,
 } from "../model/auth.model";
-import { prisma } from "../lib/prisma.js";
 
 // Web flow only — CLI holds its own codeVerifier locally
 const pkceStore = new Map<string, { codeVerifier: string; expiresAt: number }>();

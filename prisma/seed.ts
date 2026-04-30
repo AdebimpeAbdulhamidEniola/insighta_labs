@@ -47,7 +47,7 @@ async function main() {
   console.log("Seeding complete — 2026 profiles inserted");
 
   // ── Seed test users for grader ───────────────────────────────────────────────
-  // Admin user — used by test_code flow (grader auto-extracts token)
+  // Admin user — generate tokens via: npx ts-node scripts/gen-admin-token.ts
   const adminUser = await prisma.user.upsert({
     where: { github_id: "test-admin-github-id" },
     update: {
@@ -87,8 +87,9 @@ async function main() {
 
   console.log("Seeded analyst user — id:", analystUser.id);
   console.log("────────────────────────────────────────────────────────────");
-  console.log("Run this to get your Analyst Test Token:");
-  console.log(`npx ts-node scripts/gen-analyst-token.ts`);
+  console.log("Run these to get your submission tokens:");
+  console.log("  Admin + Refresh : npx ts-node scripts/gen-admin-token.ts");
+  console.log("  Analyst         : npx ts-node scripts/gen-token.ts");
   console.log("────────────────────────────────────────────────────────────");
 }
 
