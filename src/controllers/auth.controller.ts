@@ -155,7 +155,7 @@ export const handleGitHubCallback = async (
 
     // Redirect browser to the frontend dashboard
     const frontendUrl = process.env.FRONTEND_URL || "http://localhost:3001";
-    res.redirect(`${frontendUrl}/dashboard`);
+    res.redirect(`${frontendUrl}/callback`);
   } catch (error) {
     next(error);
   }
