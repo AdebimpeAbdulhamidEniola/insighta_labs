@@ -210,14 +210,14 @@ export const handleCLICallback = async (
   next: NextFunction
 ): Promise<void> => {
   try {
-    const { code, code_verifier } = req.body;
+    const { code, code_verifier, redirect_uri } = req.body;
 
-    if (!code || !code_verifier) {
-      sendError(res, 400, "Missing code or code_verifier");
+    if (!code || !code_verifier || !redirect_uri) {
+      sendError(res, 400, "Missing code, code_verifier, or redirect_uri");
       return;
     }
 
-    const tokenData = await exchangeCodeForToken(code, code_verifier);
+    const tokenData = await exchangeCodeForToken(code, code_verifier, redirect_uri);
     if (!tokenData || (tokenData as any).error) {
       sendError(res, 502, "Token exchange failed");
       return;
@@ -247,7 +247,6 @@ export const handleCLICallback = async (
     next(err);
   }
 };
-
 export const refreshAccessToken = async (
   req: Request,
   res: Response,
