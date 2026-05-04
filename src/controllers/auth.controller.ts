@@ -89,7 +89,7 @@ export const handleGitHubCallback = async (
   next: NextFunction
 ): Promise<void> => {
   try {
-    const { code, state, error, code_verifier } = req.query;
+    const { code, state, error } = req.query;
 
     if (error || !code) {
       sendError(res, 400, "Authorization denied or missing parameters");
@@ -121,7 +121,7 @@ export const handleGitHubCallback = async (
       stored.codeVerifier
     );
 
-    if (!tokenData || (tokenData as any).error) {
+    if (!tokenData || "error" in tokenData) {
       sendError(res, 502, "Token exchange failed");
       return;
     }
@@ -156,7 +156,7 @@ export const handleCLICallback = async (
     }
 
     const tokenData = await exchangeCodeForToken(code, code_verifier, redirect_uri);
-    if (!tokenData || (tokenData as any).error) {
+    if (!tokenData || "error" in tokenData) {
       sendError(res, 502, "Token exchange failed");
       return;
     }
@@ -236,7 +236,7 @@ export const logout = async (
   next: NextFunction
 ): Promise<void> => {
   try {
-    const userId = (req as any).user?.userId;
+    const userId = req.user?.userId;
     if (userId) {
       await setRefreshToken(userId, null);
     }
@@ -257,7 +257,7 @@ export const getMe = async (
   next: NextFunction
 ): Promise<void> => {
   try {
-    const userId = (req as any).user?.userId;
+    const userId = req.user?.userId as string;
     const user = await findUserById(userId);
 
     if (!user || !user.is_active) {

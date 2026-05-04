@@ -17,13 +17,19 @@ export interface GitHubUser {
   name: string | null;
 }
 
-interface GitHubTokenResponse {
+interface GitHubTokenSuccess {
+  error?: never;
   access_token: string;
   token_type: string;
   scope: string;
-  error?: string;
-  error_description?: string;
 }
+
+export interface GitHubTokenError {
+  error: string;
+  access_token?: never;
+}
+
+export type GitHubTokenResponse = GitHubTokenSuccess | GitHubTokenError;
 
 interface GitHubEmail {
   email: string;
@@ -58,7 +64,7 @@ export const exchangeCodeForToken = async (
   const finalRedirectUri = redirectUri ?? GITHUB_REDIRECT_URI;
 
   try {
-    const { data } = await axios.post<GitHubTokenResponse>(
+    const { data } = await axios.post<GitHubTokenSuccess>(
       "https://github.com/login/oauth/access_token",
       {
         client_id:     clientId,
@@ -75,11 +81,17 @@ export const exchangeCodeForToken = async (
       }
     );
 
-    if (data.error) return { error: data.error_description || data.error } as any;
+    if ("error" in data && data.error) return { error: (data as unknown as GitHubTokenError).error };
     return data;
-  } catch (error: any) {
-    console.error("Token exchange failed:", error.response?.data || error.message);
-    return { error: error.response?.data?.error_description || error.response?.data?.error || error.message } as any;
+  } catch (error: unknown) {
+    if (axios.isAxiosError(error)) {
+      const data = error.response?.data as { error_description?: string; error?: string } | undefined;
+      console.error("Token exchange failed:", data);
+      return { error: data?.error_description ?? data?.error ?? error.message };
+    }
+    const message = error instanceof Error ? error.message : "Unknown error";
+    console.error("Token exchange failed:", message);
+    return { error: message };
   }
 };
 

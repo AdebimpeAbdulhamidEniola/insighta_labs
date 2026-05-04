@@ -41,6 +41,7 @@ The content is organized as follows:
 
 <directory_structure>
 .github/workflows/ci.yml
+CLAUDE.MD
 eslint.config.mjs
 jest.config.ts
 package.json
@@ -167,6 +168,46 @@ jobs:
 
       - name: Build TypeScript
         run: npm run build
+</file>
+
+<file path="CLAUDE.MD">
+# TypeScript Best Practices
+
+## Type Safety & Configuration
+
+- Enable `strict: true` in @tsconfig.json with additional flags:
+  - `noImplicitAny: true`
+  - `strictNullChecks: true`
+  - `strictFunctionTypes: true`
+  - `strictBindCallApply: true`
+  - `strictPropertyInitialization: true`
+  - `noImplicitThis: true`
+  - `alwaysStrict: true`
+  - `exactOptionalPropertyTypes: true`
+- Never use `// @ts-ignore` or `// @ts-expect-error` without explanatory comments
+- Use `--noEmitOnError` compiler flag to prevent generating JS files when TypeScript errors exist
+
+## Type Definitions
+
+- Do not ever use `any`. Ever. If you feel like you have to use `any`, use `unknown` instead.
+- Explicitly type function parameters, return types, and object literals.
+- Please don't ever use Enums. Use a union if you feel tempted to use an Enum.
+- Use `readonly` modifiers for immutable properties and arrays
+- Leverage TypeScript's utility types (`Partial`, `Required`, `Pick`, `Omit`, `Record`, etc.)
+- Use discriminated unions with exhaustiveness checking for type narrowing
+
+## Advanced Patterns
+
+- Implement proper generics with appropriate constraints
+- Use mapped types and conditional types to reduce type duplication
+- Leverage `const` assertions for literal types
+- Implement branded/nominal types for type-level validation
+
+## Code Organization
+
+- Organize types in dedicated files (types.ts) or alongside implementations
+- Document complex types with JSDoc comments
+- Create a central `types.ts` file or a `src/types` directory for shared types
 </file>
 
 <file path="jest.config.ts">
@@ -322,49 +363,6 @@ model User {
   last_login_at DateTime?
   created_at    DateTime  @default(now())
 }
-</file>
-
-<file path="scripts/gen-admin-token.ts">
-import "dotenv/config";
-import { PrismaPg } from "@prisma/adapter-pg";
-import { PrismaClient } from "@prisma/client";
-import { generateAccessToken, generateRefreshToken } from "../src/utils/jwt.utils";
-
-const connectionString = `${process.env.DATABASE_URL}`;
-const adapter = new PrismaPg({ connectionString });
-const prisma = new PrismaClient({ adapter });
-
-async function main() {
-  const admin = await prisma.user.findFirst({
-    where: { role: "admin", is_active: true },
-  });
-
-  if (!admin) {
-    console.log("No admin user found — run: npx prisma db seed");
-    return;
-  }
-
-  const accessToken = generateAccessToken(admin.id, admin.role);
-  const refreshToken = generateRefreshToken(admin.id);
-
-  // Persist the refresh token to the DB so the grader's POST /auth/refresh
-  // call succeeds — the refreshAccessToken controller checks that
-  // user.refresh_token === the token the client sends (replay-attack guard).
-  await prisma.user.update({
-    where: { id: admin.id },
-    data: { refresh_token: refreshToken },
-  });
-
-  console.log("\n── Option 2 Tokens ──────────────────────────────────────");
-  console.log("\nAdmin Test Token (paste into submission form):");
-  console.log(accessToken);
-  console.log("\nRefresh Test Token (paste into submission form):");
-  console.log(refreshToken);
-  console.log("\n  Tokens expire in 3m / 5m — submit immediately after copying");
-  console.log("─────────────────────────────────────────────────────────\n");
-}
-
-main().finally(() => prisma.$disconnect());
 </file>
 
 <file path="seed_profiles.json">
@@ -20634,394 +20632,6 @@ main().finally(() => prisma.$disconnect());
 }
 </file>
 
-<file path="src/controllers/profile.controller.ts">
-import { Request, Response, NextFunction } from "express";
-import { sendError } from "../utils/response.utils.js";
-import {
-  findAllProfiles,
-  findAllProfilesForExport,
-  findProfileById,
-  createProfile,
-  findProfileByName,
-  deleteProfile
-} from "../model/profile.model.js";
-import { parseNaturalQuery } from "../utils/nlp.utils.js";
-import { getGenderData } from "../services/genderize.service.js";
-import { getAgeData } from "../services/agify.service.js";
-import { getNationData } from "../services/nationalize.service.js";
-import { uuidv7 } from "uuidv7";
-
-const VALID_GENDERS = ["male", "female"];
-const VALID_AGE_GROUPS = ["child", "teenager", "adult", "senior"];
-const VALID_SORT_BY = ["age", "created_at", "gender_probability"];
-const VALID_ORDER = ["asc", "desc"];
-
-// Safely wraps a CSV cell — quotes the value if it contains commas, quotes, or newlines
-const escapeCSV = (value: unknown): string => {
-  const str = value === null || value === undefined ? "" : String(value);
-  if (str.includes(",") || str.includes('"') || str.includes("\n")) {
-    return `"${str.replace(/"/g, '""')}"`;
-  }
-  return str;
-};
-
-export const getAllProfiles = async (
-  req: Request,
-  res: Response,
-  next: NextFunction
-) => {
-  try {
-    const {
-      gender,
-      age_group,
-      country_id,
-      min_age,
-      max_age,
-      min_gender_probability,
-      min_country_probability,
-      sort_by,
-      order,
-      page,
-      limit,
-    } = req.query;
-
-    if (gender !== undefined && !VALID_GENDERS.includes(gender as string)) {
-      return sendError(res, 422, "Invalid query parameters");
-    }
-    if (age_group !== undefined && !VALID_AGE_GROUPS.includes(age_group as string)) {
-      return sendError(res, 422, "Invalid query parameters");
-    }
-    if (sort_by !== undefined && !VALID_SORT_BY.includes(sort_by as string)) {
-      return sendError(res, 422, "Invalid query parameters");
-    }
-    if (order !== undefined && !VALID_ORDER.includes(order as string)) {
-      return sendError(res, 422, "Invalid query parameters");
-    }
-
-    const parsedMinAge = min_age ? Number(min_age) : undefined;
-    const parsedMaxAge = max_age ? Number(max_age) : undefined;
-    const parsedMinGenderProb = min_gender_probability ? Number(min_gender_probability) : undefined;
-    const parsedMinCountryProb = min_country_probability ? Number(min_country_probability) : undefined;
-    const parsedPage = page ? Number(page) : undefined;
-    const parsedLimit = limit ? Number(limit) : undefined;
-
-    if (parsedMinAge !== undefined && isNaN(parsedMinAge)) {
-      return sendError(res, 422, "Invalid query parameters");
-    }
-    if (parsedMaxAge !== undefined && isNaN(parsedMaxAge)) {
-      return sendError(res, 422, "Invalid query parameters");
-    }
-    if (parsedMinGenderProb !== undefined && isNaN(parsedMinGenderProb)) {
-      return sendError(res, 422, "Invalid query parameters");
-    }
-    if (parsedMinCountryProb !== undefined && isNaN(parsedMinCountryProb)) {
-      return sendError(res, 422, "Invalid query parameters");
-    }
-    if (parsedPage !== undefined && (isNaN(parsedPage) || parsedPage < 1)) {
-      return sendError(res, 422, "Invalid query parameters");
-    }
-    if (parsedLimit !== undefined && (isNaN(parsedLimit) || parsedLimit < 1)) {
-      return sendError(res, 422, "Invalid query parameters");
-    }
-
-    const result = await findAllProfiles({
-      gender: typeof gender === "string" ? gender : undefined,
-      age_group: typeof age_group === "string" ? age_group : undefined,
-      country_id: typeof country_id === "string" ? country_id : undefined,
-      min_age: parsedMinAge,
-      max_age: parsedMaxAge,
-      min_gender_probability: parsedMinGenderProb,
-      min_country_probability: parsedMinCountryProb,
-      sort_by: sort_by as "age" | "created_at" | "gender_probability" | undefined,
-      order: order as "asc" | "desc" | undefined,
-      page: parsedPage,
-      limit: parsedLimit,
-    });
-
-    const totalPages = Math.ceil(result.total / result.limit);
-
-    return res.status(200).json({
-      status: "success",
-      page: result.page,
-      limit: result.limit,
-      total: result.total,
-      total_pages: totalPages,
-      links: {
-        self: `/api/profiles?page=${result.page}&limit=${result.limit}`,
-        next: result.page < totalPages
-          ? `/api/profiles?page=${result.page + 1}&limit=${result.limit}`
-          : null,
-        prev: result.page > 1
-          ? `/api/profiles?page=${result.page - 1}&limit=${result.limit}`
-          : null,
-      },
-      data: result.data,
-    });
-  } catch (error) {
-    next(error);
-  }
-};
-
-export const searchProfiles = async (
-  req: Request,
-  res: Response,
-  next: NextFunction
-) => {
-  try {
-    const { q, page, limit } = req.query;
-
-    if (!q || (q as string).trim() === "") {
-      return sendError(res, 400, "Missing or empty query");
-    }
-
-    const filters = parseNaturalQuery(q as string);
-
-    if (!filters) {
-      return res.status(400).json({
-        status: "error",
-        message: "Unable to interpret query",
-      });
-    }
-
-    const parsedPage = page ? Number(page) : undefined;
-    const parsedLimit = limit ? Number(limit) : undefined;
-
-    if (parsedPage !== undefined && (isNaN(parsedPage) || parsedPage < 1)) {
-      return sendError(res, 422, "Invalid query parameters");
-    }
-    if (parsedLimit !== undefined && (isNaN(parsedLimit) || parsedLimit < 1)) {
-      return sendError(res, 422, "Invalid query parameters");
-    }
-
-    const result = await findAllProfiles({
-      ...filters,
-      page: parsedPage,
-      limit: parsedLimit,
-    });
-
-    const totalPages = Math.ceil(result.total / result.limit);
-
-    return res.status(200).json({
-      status: "success",
-      page: result.page,
-      limit: result.limit,
-      total: result.total,
-      total_pages: totalPages,
-      links: {
-        self: `/api/profiles/search?page=${result.page}&limit=${result.limit}`,
-        next: result.page < totalPages
-          ? `/api/profiles/search?page=${result.page + 1}&limit=${result.limit}`
-          : null,
-        prev: result.page > 1
-          ? `/api/profiles/search?page=${result.page - 1}&limit=${result.limit}`
-          : null,
-      },
-      data: result.data,
-    });
-  } catch (error) {
-    next(error);
-  }
-};
-
-export const getProfileById = async (
-  req: Request<{ id: string }>,
-  res: Response,
-  next: NextFunction
-) => {
-  try {
-    const { id } = req.params;
-
-    const profile = await findProfileById(id);
-
-    if (!profile) {
-      return sendError(res, 404, "Profile not found");
-    }
-
-    return res.status(200).json({
-      status: "success",
-      data: profile,
-    });
-  } catch (error) {
-    next(error);
-  }
-};
-
-export const createUserProfile = async (
-  req: Request,
-  res: Response,
-  next: NextFunction
-) => {
-  try {
-    const { name } = req.body;
-
-    if (name === undefined) return sendError(res, 400, "Missing name");
-    if (Array.isArray(name) || typeof name !== "string") return sendError(res, 422, "Invalid type");
-    if (name.trim() === "") return sendError(res, 400, "Empty name");
-    if (/^\d+$/.test(name.trim())) return sendError(res, 422, "Invalid type");
-
-    const existingProfile = await findProfileByName(name);
-    if (existingProfile) {
-      return res.status(200).json({
-        status: "success",
-        message: "Profile already exists",
-        data: existingProfile,
-      });
-    }
-
-    const [genderData, ageData, nationData] = await Promise.all([
-      getGenderData(name),
-      getAgeData(name),
-      getNationData(name),
-    ]);
-
-    const newProfile = await createProfile({
-      id: uuidv7(),
-      name,
-      gender: genderData.gender,
-      gender_probability: genderData.gender_probability,
-      age: ageData.age,
-      age_group: ageData.age_group,
-      country_id: nationData.country_id,
-      country_probability: nationData.country_probability,
-    });
-
-    return res.status(201).json({
-      status: "success",
-      data: newProfile,
-    });
-  } catch (error) {
-    next(error);
-  }
-};
-
-export const exportProfiles = async (
-  req: Request,
-  res: Response,
-  next: NextFunction
-) => {
-  try {
-    const {
-      format,
-      gender,
-      age_group,
-      country_id,
-      min_age,
-      max_age,
-      min_gender_probability,
-      min_country_probability,
-      sort_by,
-      order,
-    } = req.query;
-
-    // Validate format param
-    if (format !== "csv") {
-      return sendError(res, 400, "format=csv is required");
-    }
-
-    // Validate optional filter params
-    if (gender !== undefined && !VALID_GENDERS.includes(gender as string)) {
-      return sendError(res, 422, "Invalid query parameters");
-    }
-    if (age_group !== undefined && !VALID_AGE_GROUPS.includes(age_group as string)) {
-      return sendError(res, 422, "Invalid query parameters");
-    }
-    if (sort_by !== undefined && !VALID_SORT_BY.includes(sort_by as string)) {
-      return sendError(res, 422, "Invalid query parameters");
-    }
-    if (order !== undefined && !VALID_ORDER.includes(order as string)) {
-      return sendError(res, 422, "Invalid query parameters");
-    }
-
-    const parsedMinAge = min_age ? Number(min_age) : undefined;
-    const parsedMaxAge = max_age ? Number(max_age) : undefined;
-    const parsedMinGenderProb = min_gender_probability ? Number(min_gender_probability) : undefined;
-    const parsedMinCountryProb = min_country_probability ? Number(min_country_probability) : undefined;
-
-    if (parsedMinAge !== undefined && isNaN(parsedMinAge)) {
-      return sendError(res, 422, "Invalid query parameters");
-    }
-    if (parsedMaxAge !== undefined && isNaN(parsedMaxAge)) {
-      return sendError(res, 422, "Invalid query parameters");
-    }
-    if (parsedMinGenderProb !== undefined && isNaN(parsedMinGenderProb)) {
-      return sendError(res, 422, "Invalid query parameters");
-    }
-    if (parsedMinCountryProb !== undefined && isNaN(parsedMinCountryProb)) {
-      return sendError(res, 422, "Invalid query parameters");
-    }
-
-    // Fetch ALL matching profiles — no pagination cap
-    const profiles = await findAllProfilesForExport({
-      gender: typeof gender === "string" ? gender : undefined,
-      age_group: typeof age_group === "string" ? age_group : undefined,
-      country_id: typeof country_id === "string" ? country_id : undefined,
-      min_age: parsedMinAge,
-      max_age: parsedMaxAge,
-      min_gender_probability: parsedMinGenderProb,
-      min_country_probability: parsedMinCountryProb,
-      sort_by: sort_by as "age" | "created_at" | "gender_probability" | undefined,
-      order: order as "asc" | "desc" | undefined,
-    });
-
-    // TRD column order: id, name, gender, gender_probability, age, age_group,
-    //                   country_id, country_name, country_probability, created_at
-    const header = "id,name,gender,gender_probability,age,age_group,country_id,country_name,country_probability,created_at";
-
-    const rows = profiles.map((p) =>
-      [
-        escapeCSV(p.id),
-        escapeCSV(p.name),
-        escapeCSV(p.gender),
-        escapeCSV(p.gender_probability),
-        escapeCSV(p.age),
-        escapeCSV(p.age_group),
-        escapeCSV(p.country_id),
-        escapeCSV(p.country_name),
-        escapeCSV(p.country_probability),
-        escapeCSV(p.created_at.toISOString()),
-      ].join(",")
-    );
-
-    const csv = [header, ...rows].join("\n");
-
-    res.setHeader("Content-Type", "text/csv");
-    res.setHeader(
-      "Content-Disposition",
-      `attachment; filename="profiles_${Date.now()}.csv"`
-    );
-    return res.status(200).send(csv);
-  } catch (error) {
-    next(error);
-  }
-};
-
-export const deleteUserProfile = async (
-  req: Request<{ id: string }>,
-  res: Response,
-  next: NextFunction
-) => {
-  try {
-    const { id } = req.params;
-
-    // Check existence first so we return 404 (not a Prisma crash)
-    const existing = await findProfileById(id);
-    if (!existing) {
-      return sendError(res, 404, "Profile not found");
-    }
-
-    await deleteProfile(id);
-
-    return res.status(200).json({
-      status: "success",
-      message: "Profile deleted successfully",
-    });
-
-  } catch (error) {
-    next(error);
-  }
-}
-</file>
-
 <file path="src/index.ts">
 import { createApp } from "./config/app.config.js";
 import dotenv from "dotenv";
@@ -21852,141 +21462,446 @@ export default tseslint.config(
 );
 </file>
 
-<file path="prisma/seed.ts">
+<file path="scripts/gen-admin-token.ts">
 import "dotenv/config";
 import { PrismaPg } from "@prisma/adapter-pg";
 import { PrismaClient } from "@prisma/client";
-import { uuidv7 } from "uuidv7";
-import * as fs from "fs";
-import * as path from "path";
+import { Pool } from "pg";
+import { generateAccessToken, generateRefreshToken } from "../src/utils/jwt.utils";
 
-interface SeedProfile {
-  name: string;
-  gender: string;
-  gender_probability: number;
-  age: number;
-  age_group: string;
-  country_id: string;
-  country_name: string;
-  country_probability: number;
-}
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  max: 1,
+  idleTimeoutMillis: 10000,
+  connectionTimeoutMillis: 10000,
+  ssl: { rejectUnauthorized: false },
+});
 
-interface SeedData {
-  profiles: SeedProfile[];
-}
-
-const connectionString = `${process.env.DATABASE_URL}`;
-const adapter = new PrismaPg({ connectionString });
+const adapter = new PrismaPg(pool);
 const prisma = new PrismaClient({ adapter });
 
 async function main() {
-  // ── Seed profiles ────────────────────────────────────────────────────────────
-  const seedDataPath = path.join(__dirname, "../seed_profiles.json");
-  const seedData = JSON.parse(fs.readFileSync(seedDataPath, "utf-8")) as SeedData;
-
-  await prisma.profile.createMany({
-    data: seedData.profiles.map((profile) => ({
-      id: uuidv7(),
-      name: profile.name,
-      gender: profile.gender,
-      gender_probability: profile.gender_probability,
-      age: profile.age,
-      age_group: profile.age_group,
-      country_id: profile.country_id,
-      country_name: profile.country_name,
-      country_probability: profile.country_probability,
-    })),
-    skipDuplicates: true,
-  });
-
-  console.log("Seeding complete — 2026 profiles inserted");
-
-  // ── Seed test users for grader ───────────────────────────────────────────────
-  // Admin user — used by test_code flow (grader auto-extracts token)
-  const adminUser = await prisma.user.upsert({
+  const admin = await prisma.user.findUnique({
     where: { github_id: "test-admin-github-id" },
-    update: {
-      role: "admin",
-      is_active: true,
-    },
-    create: {
-      id: uuidv7(),
-      github_id: "test-admin-github-id",
-      username: "test-admin",
-      email: "admin@test.com",
-      avatar_url: "https://avatars.githubusercontent.com/u/0",
-      role: "admin",
-      is_active: true,
-    },
   });
 
-  console.log("Seeded admin user — id:", adminUser.id);
-
-  // Analyst user — token must be manually pasted into submission form
-  const analystUser = await prisma.user.upsert({
-    where: { github_id: "test-analyst-github-id" },
-    update: {
-      role: "analyst",
-      is_active: true,
-    },
-    create: {
-      id: uuidv7(),
-      github_id: "test-analyst-github-id",
-      username: "test-analyst",
-      email: "analyst@test.com",
-      avatar_url: "https://avatars.githubusercontent.com/u/0",
-      role: "analyst",
-      is_active: true,
-    },
-  });
-
-  console.log("Seeded analyst user — id:", analystUser.id);
-  console.log("────────────────────────────────────────────────────────────");
-  console.log("Run this to get your Analyst Test Token:");
-  console.log(`npx ts-node scripts/gen-analyst-token.ts`);
-  console.log("────────────────────────────────────────────────────────────");
-}
-
-main()
-  .catch((e) => {
-    console.error(e);
-    process.exit(1);
-  })
-  .finally(async () => {
-    await prisma.$disconnect();
-  });
-</file>
-
-<file path="scripts/gen-token.ts">
-import "dotenv/config";
-import { PrismaPg } from "@prisma/adapter-pg";
-import { PrismaClient } from "@prisma/client";
-import { generateAccessToken } from "../src/utils/jwt.utils";
-
-const connectionString = `${process.env.DATABASE_URL}`;
-const adapter = new PrismaPg({ connectionString });
-const prisma = new PrismaClient({ adapter });
-
-async function main() {
-  const analyst = await prisma.user.findFirst({
-    where: { role: "analyst", is_active: true },
-  });
-
-  if (!analyst) {
-    console.log("No analyst user found — run: npx prisma db seed");
+  if (!admin) {
+    console.log("No seeded admin user found — run: npx prisma db seed");
     return;
   }
 
-  const token = generateAccessToken(analyst.id, analyst.role);
+  if (!admin.is_active) {
+    console.log("Seeded admin user is deactivated — check your DB");
+    return;
+  }
 
-  console.log("\n── Option 2 Analyst Token ───────────────────────────────");
-  console.log("\nAnalyst Test Token (paste into submission form):");
-  console.log(token);
-  console.log("\n  This token expires in 3 minutes — submit immediately after copying");
+  const accessToken = generateAccessToken(admin.id, admin.role);
+  const refreshToken = generateRefreshToken(admin.id);
+
+  await prisma.user.update({
+    where: { id: admin.id },
+    data: { refresh_token: refreshToken },
+  });
+
+  console.log("\n── Option 2 Tokens ──────────────────────────────────────");
+  console.log("\nAdmin Test Token (paste into submission form):");
+  console.log(accessToken);
+  console.log("\nRefresh Test Token (paste into submission form):");
+  console.log(refreshToken);
+  console.log("\n  Tokens expire in 3m (access) / 5m (refresh).");
+  console.log("  Paste both into the submission form and submit immediately.");
   console.log("─────────────────────────────────────────────────────────\n");
 }
 
 main().finally(() => prisma.$disconnect());
+</file>
+
+<file path="src/controllers/profile.controller.ts">
+import { Request, Response, NextFunction } from "express";
+import { sendError } from "../utils/response.utils";
+import {
+  findAllProfiles,
+  findAllProfilesForExport,
+  findProfileById,
+  createProfile,
+  findProfileByName,
+  deleteProfile
+} from "../model/profile.model.js";
+import { parseNaturalQuery } from "../utils/nlp.utils";
+import { getGenderData } from "../services/genderize.service";
+import { getAgeData } from "../services/agify.service";
+import { getNationData } from "../services/nationalize.service";
+import { uuidv7 } from "uuidv7";
+
+const VALID_GENDERS = ["male", "female"];
+const VALID_AGE_GROUPS = ["child", "teenager", "adult", "senior"];
+const VALID_SORT_BY = ["age", "created_at", "gender_probability"];
+const VALID_ORDER = ["asc", "desc"];
+
+// Safely wraps a CSV cell — quotes the value if it contains commas, quotes, or newlines
+const escapeCSV = (value: unknown): string => {
+  const str = value === null || value === undefined ? "" : String(value);
+  if (str.includes(",") || str.includes('"') || str.includes("\n")) {
+    return `"${str.replace(/"/g, '""')}"`;
+  }
+  return str;
+};
+
+export const getAllProfiles = async (
+  req: Request,
+  res: Response,
+  next: NextFunction
+) => {
+  try {
+    const {
+      gender,
+      age_group,
+      country_id,
+      min_age,
+      max_age,
+      min_gender_probability,
+      min_country_probability,
+      sort_by,
+      order,
+      page,
+      limit,
+    } = req.query;
+
+    if (gender !== undefined && !VALID_GENDERS.includes(gender as string)) {
+      return sendError(res, 422, "Invalid query parameters");
+    }
+    if (age_group !== undefined && !VALID_AGE_GROUPS.includes(age_group as string)) {
+      return sendError(res, 422, "Invalid query parameters");
+    }
+    if (sort_by !== undefined && !VALID_SORT_BY.includes(sort_by as string)) {
+      return sendError(res, 422, "Invalid query parameters");
+    }
+    if (order !== undefined && !VALID_ORDER.includes(order as string)) {
+      return sendError(res, 422, "Invalid query parameters");
+    }
+
+    const parsedMinAge = min_age ? Number(min_age) : undefined;
+    const parsedMaxAge = max_age ? Number(max_age) : undefined;
+    const parsedMinGenderProb = min_gender_probability ? Number(min_gender_probability) : undefined;
+    const parsedMinCountryProb = min_country_probability ? Number(min_country_probability) : undefined;
+    const parsedPage = page ? Number(page) : undefined;
+    const parsedLimit = limit ? Number(limit) : undefined;
+
+    if (parsedMinAge !== undefined && isNaN(parsedMinAge)) {
+      return sendError(res, 422, "Invalid query parameters");
+    }
+    if (parsedMaxAge !== undefined && isNaN(parsedMaxAge)) {
+      return sendError(res, 422, "Invalid query parameters");
+    }
+    if (parsedMinGenderProb !== undefined && isNaN(parsedMinGenderProb)) {
+      return sendError(res, 422, "Invalid query parameters");
+    }
+    if (parsedMinCountryProb !== undefined && isNaN(parsedMinCountryProb)) {
+      return sendError(res, 422, "Invalid query parameters");
+    }
+    if (parsedPage !== undefined && (isNaN(parsedPage) || parsedPage < 1)) {
+      return sendError(res, 422, "Invalid query parameters");
+    }
+    if (parsedLimit !== undefined && (isNaN(parsedLimit) || parsedLimit < 1)) {
+      return sendError(res, 422, "Invalid query parameters");
+    }
+
+    const result = await findAllProfiles({
+      gender: typeof gender === "string" ? gender : undefined,
+      age_group: typeof age_group === "string" ? age_group : undefined,
+      country_id: typeof country_id === "string" ? country_id : undefined,
+      min_age: parsedMinAge,
+      max_age: parsedMaxAge,
+      min_gender_probability: parsedMinGenderProb,
+      min_country_probability: parsedMinCountryProb,
+      sort_by: sort_by as "age" | "created_at" | "gender_probability" | undefined,
+      order: order as "asc" | "desc" | undefined,
+      page: parsedPage,
+      limit: parsedLimit,
+    });
+
+    const totalPages = Math.ceil(result.total / result.limit);
+
+    return res.status(200).json({
+      status: "success",
+      page: result.page,
+      limit: result.limit,
+      total: result.total,
+      total_pages: totalPages,
+      links: {
+        self: `/api/profiles?page=${result.page}&limit=${result.limit}`,
+        next: result.page < totalPages
+          ? `/api/profiles?page=${result.page + 1}&limit=${result.limit}`
+          : null,
+        prev: result.page > 1
+          ? `/api/profiles?page=${result.page - 1}&limit=${result.limit}`
+          : null,
+      },
+      data: result.data,
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+export const searchProfiles = async (
+  req: Request,
+  res: Response,
+  next: NextFunction
+) => {
+  try {
+    const { q, page, limit } = req.query;
+
+    if (!q || (q as string).trim() === "") {
+      return sendError(res, 400, "Missing or empty query");
+    }
+
+    const filters = parseNaturalQuery(q as string);
+
+    if (!filters) {
+      return res.status(400).json({
+        status: "error",
+        message: "Unable to interpret query",
+      });
+    }
+
+    const parsedPage = page ? Number(page) : undefined;
+    const parsedLimit = limit ? Number(limit) : undefined;
+
+    if (parsedPage !== undefined && (isNaN(parsedPage) || parsedPage < 1)) {
+      return sendError(res, 422, "Invalid query parameters");
+    }
+    if (parsedLimit !== undefined && (isNaN(parsedLimit) || parsedLimit < 1)) {
+      return sendError(res, 422, "Invalid query parameters");
+    }
+
+    const result = await findAllProfiles({
+      ...filters,
+      page: parsedPage,
+      limit: parsedLimit,
+    });
+
+    const totalPages = Math.ceil(result.total / result.limit);
+
+    return res.status(200).json({
+      status: "success",
+      page: result.page,
+      limit: result.limit,
+      total: result.total,
+      total_pages: totalPages,
+      links: {
+        self: `/api/profiles/search?page=${result.page}&limit=${result.limit}`,
+        next: result.page < totalPages
+          ? `/api/profiles/search?page=${result.page + 1}&limit=${result.limit}`
+          : null,
+        prev: result.page > 1
+          ? `/api/profiles/search?page=${result.page - 1}&limit=${result.limit}`
+          : null,
+      },
+      data: result.data,
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+export const getProfileById = async (
+  req: Request<{ id: string }>,
+  res: Response,
+  next: NextFunction
+) => {
+  try {
+    const { id } = req.params;
+
+    const profile = await findProfileById(id);
+
+    if (!profile) {
+      return sendError(res, 404, "Profile not found");
+    }
+
+    return res.status(200).json({
+      status: "success",
+      data: profile,
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+export const createUserProfile = async (
+  req: Request,
+  res: Response,
+  next: NextFunction
+) => {
+  try {
+    const { name } = req.body;
+
+    if (name === undefined) return sendError(res, 400, "Missing name");
+    if (Array.isArray(name) || typeof name !== "string") return sendError(res, 422, "Invalid type");
+    if (name.trim() === "") return sendError(res, 400, "Empty name");
+    if (/^\d+$/.test(name.trim())) return sendError(res, 422, "Invalid type");
+
+    const existingProfile = await findProfileByName(name);
+    if (existingProfile) {
+      return res.status(200).json({
+        status: "success",
+        message: "Profile already exists",
+        data: existingProfile,
+      });
+    }
+
+    const [genderData, ageData, nationData] = await Promise.all([
+      getGenderData(name),
+      getAgeData(name),
+      getNationData(name),
+    ]);
+
+    const newProfile = await createProfile({
+      id: uuidv7(),
+      name,
+      gender: genderData.gender,
+      gender_probability: genderData.gender_probability,
+      age: ageData.age,
+      age_group: ageData.age_group,
+      country_id: nationData.country_id,
+      country_probability: nationData.country_probability,
+    });
+
+    return res.status(201).json({
+      status: "success",
+      data: newProfile,
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+export const exportProfiles = async (
+  req: Request,
+  res: Response,
+  next: NextFunction
+) => {
+  try {
+    const {
+      format,
+      gender,
+      age_group,
+      country_id,
+      min_age,
+      max_age,
+      min_gender_probability,
+      min_country_probability,
+      sort_by,
+      order,
+    } = req.query;
+
+    // Validate format param
+    if (format !== "csv") {
+      return sendError(res, 400, "format=csv is required");
+    }
+
+    // Validate optional filter params
+    if (gender !== undefined && !VALID_GENDERS.includes(gender as string)) {
+      return sendError(res, 422, "Invalid query parameters");
+    }
+    if (age_group !== undefined && !VALID_AGE_GROUPS.includes(age_group as string)) {
+      return sendError(res, 422, "Invalid query parameters");
+    }
+    if (sort_by !== undefined && !VALID_SORT_BY.includes(sort_by as string)) {
+      return sendError(res, 422, "Invalid query parameters");
+    }
+    if (order !== undefined && !VALID_ORDER.includes(order as string)) {
+      return sendError(res, 422, "Invalid query parameters");
+    }
+
+    const parsedMinAge = min_age ? Number(min_age) : undefined;
+    const parsedMaxAge = max_age ? Number(max_age) : undefined;
+    const parsedMinGenderProb = min_gender_probability ? Number(min_gender_probability) : undefined;
+    const parsedMinCountryProb = min_country_probability ? Number(min_country_probability) : undefined;
+
+    if (parsedMinAge !== undefined && isNaN(parsedMinAge)) {
+      return sendError(res, 422, "Invalid query parameters");
+    }
+    if (parsedMaxAge !== undefined && isNaN(parsedMaxAge)) {
+      return sendError(res, 422, "Invalid query parameters");
+    }
+    if (parsedMinGenderProb !== undefined && isNaN(parsedMinGenderProb)) {
+      return sendError(res, 422, "Invalid query parameters");
+    }
+    if (parsedMinCountryProb !== undefined && isNaN(parsedMinCountryProb)) {
+      return sendError(res, 422, "Invalid query parameters");
+    }
+
+    // Fetch ALL matching profiles — no pagination cap
+    const profiles = await findAllProfilesForExport({
+      gender: typeof gender === "string" ? gender : undefined,
+      age_group: typeof age_group === "string" ? age_group : undefined,
+      country_id: typeof country_id === "string" ? country_id : undefined,
+      min_age: parsedMinAge,
+      max_age: parsedMaxAge,
+      min_gender_probability: parsedMinGenderProb,
+      min_country_probability: parsedMinCountryProb,
+      sort_by: sort_by as "age" | "created_at" | "gender_probability" | undefined,
+      order: order as "asc" | "desc" | undefined,
+    });
+
+    // TRD column order: id, name, gender, gender_probability, age, age_group,
+    //                   country_id, country_name, country_probability, created_at
+    const header = "id,name,gender,gender_probability,age,age_group,country_id,country_name,country_probability,created_at";
+
+    const rows = profiles.map((p) =>
+      [
+        escapeCSV(p.id),
+        escapeCSV(p.name),
+        escapeCSV(p.gender),
+        escapeCSV(p.gender_probability),
+        escapeCSV(p.age),
+        escapeCSV(p.age_group),
+        escapeCSV(p.country_id),
+        escapeCSV(p.country_name),
+        escapeCSV(p.country_probability),
+        escapeCSV(p.created_at.toISOString()),
+      ].join(",")
+    );
+
+    const csv = [header, ...rows].join("\n");
+
+    res.setHeader("Content-Type", "text/csv");
+    res.setHeader(
+      "Content-Disposition",
+      `attachment; filename="profiles_${Date.now()}.csv"`
+    );
+    return res.status(200).send(csv);
+  } catch (error) {
+    next(error);
+  }
+};
+
+export const deleteUserProfile = async (
+  req: Request<{ id: string }>,
+  res: Response,
+  next: NextFunction
+) => {
+  try {
+    const { id } = req.params;
+
+    // Check existence first so we return 404 (not a Prisma crash)
+    const existing = await findProfileById(id);
+    if (!existing) {
+      return sendError(res, 404, "Profile not found");
+    }
+
+    await deleteProfile(id);
+
+    return res.status(200).json({
+      status: "success",
+      message: "Profile deleted successfully",
+    });
+
+  } catch (error) {
+    next(error);
+  }
+}
 </file>
 
 <file path="src/middlewares/ratelimit.middleware.ts">
@@ -22100,6 +22015,112 @@ router.post("/", requireRole("admin"), createUserProfile);
 router.delete("/:id", requireRole("admin"), deleteUserProfile);
 
 export default router;
+</file>
+
+<file path="prisma/seed.ts">
+import "dotenv/config";
+import { PrismaPg } from "@prisma/adapter-pg";
+import { PrismaClient } from "@prisma/client";
+import { uuidv7 } from "uuidv7";
+import * as fs from "fs";
+import * as path from "path";
+
+interface SeedProfile {
+  name: string;
+  gender: string;
+  gender_probability: number;
+  age: number;
+  age_group: string;
+  country_id: string;
+  country_name: string;
+  country_probability: number;
+}
+
+interface SeedData {
+  profiles: SeedProfile[];
+}
+
+const connectionString = `${process.env.DATABASE_URL}`;
+const adapter = new PrismaPg({ connectionString });
+const prisma = new PrismaClient({ adapter });
+
+async function main() {
+  // ── Seed profiles ────────────────────────────────────────────────────────────
+  const seedDataPath = path.join(__dirname, "../seed_profiles.json");
+  const seedData = JSON.parse(fs.readFileSync(seedDataPath, "utf-8")) as SeedData;
+
+  await prisma.profile.createMany({
+    data: seedData.profiles.map((profile) => ({
+      id: uuidv7(),
+      name: profile.name,
+      gender: profile.gender,
+      gender_probability: profile.gender_probability,
+      age: profile.age,
+      age_group: profile.age_group,
+      country_id: profile.country_id,
+      country_name: profile.country_name,
+      country_probability: profile.country_probability,
+    })),
+    skipDuplicates: true,
+  });
+
+  console.log("Seeding complete — 2026 profiles inserted");
+
+  // ── Seed test users for grader ───────────────────────────────────────────────
+  // Admin user — generate tokens via: npx ts-node scripts/gen-admin-token.ts
+  const adminUser = await prisma.user.upsert({
+    where: { github_id: "test-admin-github-id" },
+    update: {
+      role: "admin",
+      is_active: true,
+    },
+    create: {
+      id: uuidv7(),
+      github_id: "test-admin-github-id",
+      username: "test-admin",
+      email: "admin@test.com",
+      avatar_url: "https://avatars.githubusercontent.com/u/0",
+      role: "admin",
+      is_active: true,
+    },
+  });
+
+  console.log("Seeded admin user — id:", adminUser.id);
+
+  // Analyst user — token must be manually pasted into submission form
+  const analystUser = await prisma.user.upsert({
+    where: { github_id: "test-analyst-github-id" },
+    update: {
+      role: "analyst",
+      is_active: true,
+    },
+    create: {
+      id: uuidv7(),
+      github_id: "test-analyst-github-id",
+      username: "test-analyst",
+      email: "analyst@test.com",
+      avatar_url: "https://avatars.githubusercontent.com/u/0",
+      role: "analyst",
+      is_active: true,
+    },
+  });
+
+  console.log("Seeded analyst user — id:", analystUser.id);
+  console.log("────────────────────────────────────────────────────────────");
+  console.log("Run these to get your submission tokens:");
+  console.log("  Admin + Refresh : npx ts-node scripts/gen-admin-token.ts");
+  console.log("  Analyst         : npx ts-node scripts/gen-token.ts");
+  console.log("────────────────────────────────────────────────────────────");
+}
+
+main()
+  .catch((e) => {
+    console.error(e);
+    process.exit(1);
+  })
+  .finally(async () => {
+    await prisma.$disconnect();
+  });
 </file>
 
 <file path="README.md">
@@ -22882,6 +22903,51 @@ export const setRefreshToken = (userId: string, token: string | null) => {
 }
 </file>
 
+<file path="scripts/gen-token.ts">
+import "dotenv/config";
+import { PrismaPg } from "@prisma/adapter-pg";
+import { PrismaClient } from "@prisma/client";
+import { Pool } from "pg";
+import { generateAccessToken } from "../src/utils/jwt.utils";
+
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  max: 1,
+  idleTimeoutMillis: 10000,
+  connectionTimeoutMillis: 10000,
+  ssl: { rejectUnauthorized: false },
+});
+
+const adapter = new PrismaPg(pool);
+const prisma = new PrismaClient({ adapter });
+
+async function main() {
+  const analyst = await prisma.user.findUnique({
+    where: { github_id: "test-analyst-github-id" },
+  });
+
+  if (!analyst) {
+    console.log("No seeded analyst user found — run: npx prisma db seed");
+    return;
+  }
+
+  if (!analyst.is_active) {
+    console.log("Seeded analyst user is deactivated — check your DB");
+    return;
+  }
+
+  const token = generateAccessToken(analyst.id, analyst.role);
+
+  console.log("\n── Option 2 Analyst Token ───────────────────────────────");
+  console.log("\nAnalyst Test Token (paste into submission form):");
+  console.log(token);
+  console.log("\n  This token expires in 3 minutes — submit immediately after copying");
+  console.log("─────────────────────────────────────────────────────────\n");
+}
+
+main().finally(() => prisma.$disconnect());
+</file>
+
 <file path="src/config/app.config.ts">
 import cors from "cors";
 import express, { Application } from "express";
@@ -22950,12 +23016,12 @@ import {
   generateCodeVerifier,
   generateCodeChallenge,
   generateState,
-} from "../utils/pkce.utils.js";
+} from "../utils/pkce.utils";
 import {
   generateAccessToken,
   generateRefreshToken,
   verifyRefreshToken,
-} from "../utils/jwt.utils.js";
+} from "../utils/jwt.utils";
 import {
   buildAuthorizationUrl,
   exchangeCodeForToken,
@@ -22968,7 +23034,6 @@ import {
   findUserById,
   setRefreshToken,
 } from "../model/auth.model";
-import { prisma } from "../lib/prisma.js";
 
 // Web flow only — CLI holds its own codeVerifier locally
 const pkceStore = new Map<string, { codeVerifier: string; expiresAt: number }>();
@@ -23004,21 +23069,7 @@ const resolveUser = async (githubAccessToken: string, res: Response) => {
   return user;
 };
 
-/**
- * Reusable cookie options builder.
- *
- * FIX 1 — sameSite: "none" in production
- * Frontend (Vercel) and backend (Railway) are on different domains.
- * sameSite: "lax" blocks cookies on cross-site XHR requests — meaning
- * when React on Vercel calls /api/users/me on Railway, the cookie is
- * silently dropped and the backend returns 401.
- * sameSite: "none" allows cross-site XHR but REQUIRES secure: true (HTTPS).
- * Both Vercel and Railway use HTTPS so this is safe in production.
- *
- * In development (localhost) we use "lax" because:
- * - localhost is same-site so "lax" works fine
- * - "none" requires HTTPS which localhost doesn't have
- */
+
 const cookieOptions = (maxAgeMs: number) => {
   const isProduction = process.env.NODE_ENV === "production";
   return {
@@ -23044,22 +23095,7 @@ export const initiateGitHubAuth = (req: Request, res: Response): void => {
   res.redirect(buildAuthorizationUrl(state, codeChallenge));
 };
 
-/**
- * Web callback — GitHub redirects here after the user approves.
- *
- * WHY COOKIES INSTEAD OF JSON:
- * The browser cannot capture a JSON response from a redirect and pass it
- * to the web portal. If we return JSON here, the browser just displays it
- * as raw text and the web portal never receives the tokens.
- *
- * FIX 2 — redirect to /callback NOT /dashboard
- * Redirecting straight to /dashboard causes ProtectedRoute to see
- * user = null (React just mounted, AuthContext hasn't finished loading)
- * and immediately kick the user back to /login.
- * Redirecting to /callback lets the OAuthCallback component run first.
- * It calls getMe(), sets the user in React context via login(), and
- * THEN navigates to /dashboard — session is fully established first.
- */
+
 export const handleGitHubCallback = async (
   req: Request,
   res: Response,
@@ -23070,39 +23106,6 @@ export const handleGitHubCallback = async (
 
     if (error || !code) {
       sendError(res, 400, "Authorization denied or missing parameters");
-      return;
-    }
-
-    // CLI flow via GET: `code` and `code_verifier` are provided, `state` might be absent
-    if (code_verifier) {
-      const tokenData = await exchangeCodeForToken(
-        code as string,
-        code_verifier as string
-      );
-      if (!tokenData || (tokenData as any).error) {
-        sendError(res, 502, "Token exchange failed");
-        return;
-      }
-      const user = await resolveUser(tokenData.access_token, res);
-      if (!user) return;
-
-      const accessToken = generateAccessToken(user.id, user.role);
-      const refreshToken = generateRefreshToken(user.id);
-      await setRefreshToken(user.id, refreshToken);
-
-      res.status(200).json({
-        status: "success",
-        access_token: accessToken,
-        refresh_token: refreshToken,
-        user: {
-          id: user.id,
-          username: user.username,
-          email: user.email,
-          role: user.role,
-          avatar_url: user.avatar_url,
-          github_id: user.github_id,
-        },
-      });
       return;
     }
 
@@ -23158,14 +23161,14 @@ export const handleCLICallback = async (
   next: NextFunction
 ): Promise<void> => {
   try {
-    const { code, code_verifier } = req.body;
+    const { code, code_verifier, redirect_uri } = req.body;
 
-    if (!code || !code_verifier) {
-      sendError(res, 400, "Missing code or code_verifier");
+    if (!code || !code_verifier || !redirect_uri) {
+      sendError(res, 400, "Missing code, code_verifier, or redirect_uri");
       return;
     }
 
-    const tokenData = await exchangeCodeForToken(code, code_verifier);
+    const tokenData = await exchangeCodeForToken(code, code_verifier, redirect_uri);
     if (!tokenData || (tokenData as any).error) {
       sendError(res, 502, "Token exchange failed");
       return;
@@ -23195,7 +23198,6 @@ export const handleCLICallback = async (
     next(err);
   }
 };
-
 export const refreshAccessToken = async (
   req: Request,
   res: Response,
