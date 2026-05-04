@@ -1,5 +1,5 @@
 import { Request, Response, NextFunction } from "express";
-import { sendError } from "../utils/response.utils.js";
+import { sendError } from "../utils/response.utils";
 import {
   findAllProfiles,
   findAllProfilesForExport,
@@ -8,10 +8,10 @@ import {
   findProfileByName,
   deleteProfile
 } from "../model/profile.model.js";
-import { parseNaturalQuery } from "../utils/nlp.utils.js";
-import { getGenderData } from "../services/genderize.service.js";
-import { getAgeData } from "../services/agify.service.js";
-import { getNationData } from "../services/nationalize.service.js";
+import { parseNaturalQuery } from "../utils/nlp.utils";
+import { getGenderData } from "../services/genderize.service";
+import { getAgeData } from "../services/agify.service";
+import { getNationData } from "../services/nationalize.service";
 import { uuidv7 } from "uuidv7";
 
 const VALID_GENDERS = ["male", "female"];

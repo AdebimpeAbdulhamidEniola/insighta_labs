@@ -3,12 +3,12 @@ import {
   generateCodeVerifier,
   generateCodeChallenge,
   generateState,
-} from "../utils/pkce.utils.js";
+} from "../utils/pkce.utils";
 import {
   generateAccessToken,
   generateRefreshToken,
   verifyRefreshToken,
-} from "../utils/jwt.utils.js";
+} from "../utils/jwt.utils";
 import {
   buildAuthorizationUrl,
   exchangeCodeForToken,
@@ -56,21 +56,7 @@ const resolveUser = async (githubAccessToken: string, res: Response) => {
   return user;
 };
 
-/**
- * Reusable cookie options builder.
- *
- * FIX 1 — sameSite: "none" in production
- * Frontend (Vercel) and backend (Railway) are on different domains.
- * sameSite: "lax" blocks cookies on cross-site XHR requests — meaning
- * when React on Vercel calls /api/users/me on Railway, the cookie is
- * silently dropped and the backend returns 401.
- * sameSite: "none" allows cross-site XHR but REQUIRES secure: true (HTTPS).
- * Both Vercel and Railway use HTTPS so this is safe in production.
- *
- * In development (localhost) we use "lax" because:
- * - localhost is same-site so "lax" works fine
- * - "none" requires HTTPS which localhost doesn't have
- */
+
 const cookieOptions = (maxAgeMs: number) => {
   const isProduction = process.env.NODE_ENV === "production";
   return {
@@ -96,22 +82,7 @@ export const initiateGitHubAuth = (req: Request, res: Response): void => {
   res.redirect(buildAuthorizationUrl(state, codeChallenge));
 };
 
-/**
- * Web callback — GitHub redirects here after the user approves.
- *
- * WHY COOKIES INSTEAD OF JSON:
- * The browser cannot capture a JSON response from a redirect and pass it
- * to the web portal. If we return JSON here, the browser just displays it
- * as raw text and the web portal never receives the tokens.
- *
- * FIX 2 — redirect to /callback NOT /dashboard
- * Redirecting straight to /dashboard causes ProtectedRoute to see
- * user = null (React just mounted, AuthContext hasn't finished loading)
- * and immediately kick the user back to /login.
- * Redirecting to /callback lets the OAuthCallback component run first.
- * It calls getMe(), sets the user in React context via login(), and
- * THEN navigates to /dashboard — session is fully established first.
- */
+
 export const handleGitHubCallback = async (
   req: Request,
   res: Response,
@@ -122,39 +93,6 @@ export const handleGitHubCallback = async (
 
     if (error || !code) {
       sendError(res, 400, "Authorization denied or missing parameters");
-      return;
-    }
-
-    // CLI flow via GET: `code` and `code_verifier` are provided, `state` might be absent
-    if (code_verifier) {
-      const tokenData = await exchangeCodeForToken(
-        code as string,
-        code_verifier as string
-      );
-      if (!tokenData || (tokenData as any).error) {
-        sendError(res, 502, "Token exchange failed");
-        return;
-      }
-      const user = await resolveUser(tokenData.access_token, res);
-      if (!user) return;
-
-      const accessToken = generateAccessToken(user.id, user.role);
-      const refreshToken = generateRefreshToken(user.id);
-      await setRefreshToken(user.id, refreshToken);
-
-      res.status(200).json({
-        status: "success",
-        access_token: accessToken,
-        refresh_token: refreshToken,
-        user: {
-          id: user.id,
-          username: user.username,
-          email: user.email,
-          role: user.role,
-          avatar_url: user.avatar_url,
-          github_id: user.github_id,
-        },
-      });
       return;
     }
 
