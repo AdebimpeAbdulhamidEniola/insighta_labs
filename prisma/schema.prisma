@@ -23,8 +23,18 @@ model Profile {
   country_name        String?
   country_probability Float
   created_at          DateTime @default(now())
-}
 
+  
+  @@index([gender])
+  @@index([age_group])
+  @@index([country_id])
+  @@index([age])
+  @@index([gender_probability])
+
+
+  
+  @@index([gender, age_group, country_id])
+}
 
 model User {
   id            String    @id

@@ -13,6 +13,26 @@ import { getGenderData } from "../services/genderize.service";
 import { getAgeData } from "../services/agify.service";
 import { getNationData } from "../services/nationalize.service";
 import { uuidv7 } from "uuidv7";
+import { profileCache } from "../lib/cache";
+import { buildCacheKey } from "../utils/cache-key.utils";
+
+type ProfileQueryResult = {
+  data: {
+    id: string;
+    name: string;
+    gender: string;
+    gender_probability: number;
+    age: number;
+    age_group: string;
+    country_id: string;
+    country_name: string | null;
+    country_probability: number;
+    created_at: Date;
+  }[];
+  total: number;
+  page: number;
+  limit: number;
+};
 
 const VALID_GENDERS = ["male", "female"];
 const VALID_AGE_GROUPS = ["child", "teenager", "adult", "senior"];
@@ -48,6 +68,7 @@ export const getAllProfiles = async (
       limit,
     } = req.query;
 
+    
     if (gender !== undefined && !VALID_GENDERS.includes(gender as string)) {
       return sendError(res, 422, "Invalid query parameters");
     }
@@ -86,8 +107,8 @@ export const getAllProfiles = async (
     if (parsedLimit !== undefined && (isNaN(parsedLimit) || parsedLimit < 1)) {
       return sendError(res, 422, "Invalid query parameters");
     }
-
-    const result = await findAllProfiles({
+   
+    const filters = {
       gender: typeof gender === "string" ? gender : undefined,
       age_group: typeof age_group === "string" ? age_group : undefined,
       country_id: typeof country_id === "string" ? country_id : undefined,
@@ -99,7 +120,38 @@ export const getAllProfiles = async (
       order: order as "asc" | "desc" | undefined,
       page: parsedPage,
       limit: parsedLimit,
-    });
+    };
+
+    // ── Cache check ────────────────────────────────────────
+    const cacheKey = buildCacheKey(filters);
+    const cached = profileCache.get<ProfileQueryResult>(cacheKey);
+    if (cached) {
+      const totalPages = Math.ceil(cached.total / cached.limit);
+      return res.status(200).json({
+        status: "success",
+        page: cached.page,
+        limit: cached.limit,
+        total: cached.total,
+        total_pages: totalPages,
+        links: {
+          self: `/api/profiles?page=${cached.page}&limit=${cached.limit}`,
+          next: cached.page < totalPages
+            ? `/api/profiles?page=${cached.page + 1}&limit=${cached.limit}`
+            : null,
+          prev: cached.page > 1
+            ? `/api/profiles?page=${cached.page - 1}&limit=${cached.limit}`
+            : null,
+        },
+        data: cached.data,
+      });
+    }
+    // ──────────────────────────────────────────────────────
+
+    // Cache miss — query the database
+    const result = await findAllProfiles(filters);
+
+    // Store in cache before responding
+    profileCache.set(cacheKey, result);
 
     const totalPages = Math.ceil(result.total / result.limit);
 
@@ -156,11 +208,38 @@ export const searchProfiles = async (
       return sendError(res, 422, "Invalid query parameters");
     }
 
+    // ── Cache check ──────────────────────────────────────
+    const cacheKey = buildCacheKey({ ...filters, page: parsedPage, limit: parsedLimit });
+    const cached = profileCache.get<ProfileQueryResult>(cacheKey);
+    if (cached) {
+      const totalPages = Math.ceil(cached.total / cached.limit);
+      return res.status(200).json({
+        status: "success",
+        page: cached.page,
+        limit: cached.limit,
+        total: cached.total,
+        total_pages: totalPages,
+        links: {
+          self: `/api/profiles/search?page=${cached.page}&limit=${cached.limit}`,
+          next: cached.page < totalPages
+            ? `/api/profiles/search?page=${cached.page + 1}&limit=${cached.limit}`
+            : null,
+          prev: cached.page > 1
+            ? `/api/profiles/search?page=${cached.page - 1}&limit=${cached.limit}`
+            : null,
+        },
+        data: cached.data,
+      });
+    }
+    // ────────────────────────────────────────────────────
+
     const result = await findAllProfiles({
       ...filters,
       page: parsedPage,
       limit: parsedLimit,
     });
+
+    profileCache.set(cacheKey, result);
 
     const totalPages = Math.ceil(result.total / result.limit);
 
@@ -247,6 +326,8 @@ export const createUserProfile = async (
       country_id: nationData.country_id,
       country_probability: nationData.country_probability,
     });
+
+    profileCache.invalidate()
 
     return res.status(201).json({
       status: "success",
@@ -373,6 +454,7 @@ export const deleteUserProfile = async (
     }
 
     await deleteProfile(id);
+    profileCache.invalidate()
 
     return res.status(200).json({
       status: "success",
