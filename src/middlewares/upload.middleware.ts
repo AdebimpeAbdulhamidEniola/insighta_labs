@@ -5,7 +5,7 @@ import { Request } from "express";
 
 const storage = multer.diskStorage({
   destination: (_req, _file, cb) => {
-    cb(null, "os.tmpdir()"); // Save to system temp directory
+    cb(null, os.tmpdir()); // Save to system temp directory
   },
   filename: (_req, file, cb) => {
     const unique = `${Date.now()}-${Math.round(Math.random() * 1e9)}`;

@@ -53,6 +53,7 @@ prisma/migrations/20260426060614_add_user/migration.sql
 prisma/migrations/20260426132235_add_column/migration.sql
 prisma/migrations/20260427072532_make_country_name_optional/migration.sql
 prisma/migrations/20260505081225_add_profile_indexes/migration.sql
+prisma/migrations/20260505184807_add_created_at_index/migration.sql
 prisma/migrations/migration_lock.toml
 prisma/schema.prisma
 prisma/seed.ts
@@ -96,259 +97,6 @@ tsconfig.json
 
 <files>
 This section contains the contents of the repository's files.
-
-<file path="src/controllers/ingestion.controller.ts">
-import { Request, Response, NextFunction } from "express";
-import fs from "fs";
-import { parse } from "csv-parse";
-import { profileCache } from "../lib/cache";
-import { sendError } from "../utils/response.utils";
-import { findExistingNames, insertProfiles, ValidRow } from "../model/ingestion.model";
-
-const CHUNK_SIZE = 500;
-const VALID_GENDERS = ["male", "female"];
-const VALID_AGE_GROUPS = ["child", "teenager", "adult", "senior"];
-
-interface SkipReasons {
-  duplicate_name: number;
-  invalid_age: number;
-  missing_fields: number;
-  invalid_gender: number;
-  malformed_row: number;
-}
-
-const processChunk = async (
-  rows: ValidRow[],
-  inserted: { count: number },
-  reasons: SkipReasons
-): Promise<void> => {
-  const names = rows.map((r) => r.name);
-  const existingNames = await findExistingNames(names);
-
-  const toInsert = rows.filter((r) => {
-    if (existingNames.has(r.name)) {
-      reasons.duplicate_name++;
-      return false;
-    }
-    return true;
-  });
-
-  if (toInsert.length === 0) return;
-
-  await insertProfiles(toInsert);
-
-  inserted.count += toInsert.length;
-};
-
-export const uploadCSV = async (
-  req: Request,
-  res: Response,
-  next: NextFunction
-): Promise<void> => {
-  if (!req.file) {
-    sendError(res, 400, "No file uploaded");
-    return;
-  }
-
-  const filePath = req.file.path;
-
-  let totalRows = 0;
-  const inserted = { count: 0 };
-  const reasons: SkipReasons = {
-    duplicate_name: 0,
-    invalid_age: 0,
-    missing_fields: 0,
-    invalid_gender: 0,
-    malformed_row: 0,
-  };
-
-  try {
-    const chunk: ValidRow[] = [];
-
-    const parser = fs.createReadStream(filePath).pipe(
-      parse({
-        columns: true,
-        skip_empty_lines: true,
-        trim: true,
-        relax_column_count: false,
-      })
-    );
-
-    for await (const row of parser) {
-      totalRows++;
-
-      const {
-        name,
-        gender,
-        gender_probability,
-        age,
-        age_group,
-        country_id,
-        country_probability,
-      } = row;
-
-      if (
-        !name ||
-        !gender ||
-        gender_probability === undefined ||
-        age === undefined ||
-        !age_group ||
-        !country_id ||
-        country_probability === undefined
-      ) {
-        reasons.missing_fields++;
-        continue;
-      }
-
-      if (!VALID_GENDERS.includes((gender as string).toLowerCase())) {
-        reasons.invalid_gender++;
-        continue;
-      }
-
-      const parsedAge = Number(age);
-      if (isNaN(parsedAge) || parsedAge < 0 || !Number.isInteger(parsedAge)) {
-        reasons.invalid_age++;
-        continue;
-      }
-
-      if (!VALID_AGE_GROUPS.includes(age_group as string)) {
-        reasons.invalid_age++;
-        continue;
-      }
-
-      const parsedGenderProb = Number(gender_probability);
-      const parsedCountryProb = Number(country_probability);
-
-      if (isNaN(parsedGenderProb) || isNaN(parsedCountryProb)) {
-        reasons.malformed_row++;
-        continue;
-      }
-
-      chunk.push({
-        name: (name as string).trim(),
-        gender: (gender as string).toLowerCase(),
-        gender_probability: parsedGenderProb,
-        age: parsedAge,
-        age_group: age_group as string,
-        country_id: (country_id as string).toUpperCase(),
-        country_name: (row.country_name as string) || null,
-        country_probability: parsedCountryProb,
-      });
-
-      if (chunk.length === CHUNK_SIZE) {
-        await processChunk(chunk, inserted, reasons);
-        chunk.length = 0;
-      }
-    }
-
-    if (chunk.length > 0) {
-      await processChunk(chunk, inserted, reasons);
-    }
-
-  } catch (error) {
-    fs.unlink(filePath, () => {});
-    next(error);
-    return;
-  }
-
-  fs.unlink(filePath, () => {});
-
-  profileCache.invalidate();
-
-  const skipped = totalRows - inserted.count;
-
-  res.status(200).json({
-    status: "success",
-    total_rows: totalRows,
-    inserted: inserted.count,
-    skipped,
-    reasons,
-  });
-};
-</file>
-
-<file path="src/middlewares/upload.middleware.ts">
-import multer from "multer";
-import path from "path";
-import { Request } from "express";
-
-const storage = multer.diskStorage({
-  destination: (_req, _file, cb) => {
-    cb(null, "uploads/");
-  },
-  filename: (_req, file, cb) => {
-    const unique = `${Date.now()}-${Math.round(Math.random() * 1e9)}`;
-    cb(null, `${unique}${path.extname(file.originalname)}`);
-  },
-});
-
-const fileFilter = (_req: Request, file: Express.Multer.File, cb: multer.FileFilterCallback) => {
-  if (file.mimetype === "text/csv") {
-    cb(null, true);
-  } else {
-    cb(new Error("Only CSV files are allowed"));
-  }
-};
-
-export const upload = multer({ storage, fileFilter });
-</file>
-
-<file path="src/model/ingestion.model.ts">
-import { prisma } from "../lib/prisma";
-import { uuidv7 } from "uuidv7";
-
-export interface ValidRow {
-  name: string;
-  gender: string;
-  gender_probability: number;
-  age: number;
-  age_group: string;
-  country_id: string;
-  country_name: string | null;
-  country_probability: number;
-}
-
-export const findExistingNames = async (names: string[]): Promise<Set<string>> => {
-  const existing = await prisma.profile.findMany({
-    where: { name: { in: names } },
-    select: { name: true },
-  });
-
-  return new Set(existing.map((e) => e.name));
-};
-
-export const insertProfiles = async (rows: ValidRow[]): Promise<void> => {
-  await prisma.profile.createMany({
-    data: rows.map((r) => ({
-      id: uuidv7(),
-      ...r,
-    })),
-    skipDuplicates: true,
-  });
-};
-</file>
-
-<file path="src/routes/ingestion.route.ts">
-import { Router } from "express";           
-import { uploadCSV } from "../controllers/ingestion.controller";
-import { authenticate, requireRole } from "../middlewares/auth.middleware";
-import { apiRateLimiter } from "../middlewares/ratelimit.middleware";
-import { requireApiVersion } from "../middlewares/apiversion.middleware";
-import { upload } from "../middlewares/upload.middleware";
-
-const router = Router();
-
-// All ingestion routes require authentication, admin role, rate limiting, and API version header
-router.use(requireApiVersion);
-router.use(authenticate);
-router.use(requireRole("admin"));
-router.use(apiRateLimiter);
-
-// Only admins can bulk upload
-router.post("/", requireRole("admin"), upload.single("file"), uploadCSV);
-
-export default router;
-</file>
 
 <file path=".github/workflows/ci.yml">
 name: CI
@@ -594,6 +342,11 @@ CREATE INDEX "Profile_gender_probability_idx" ON "Profile"("gender_probability")
 
 -- CreateIndex
 CREATE INDEX "Profile_gender_age_group_country_id_idx" ON "Profile"("gender", "age_group", "country_id");
+</file>
+
+<file path="prisma/migrations/20260505184807_add_created_at_index/migration.sql">
+-- CreateIndex
+CREATE INDEX "Profile_created_at_idx" ON "Profile"("created_at");
 </file>
 
 <file path="prisma/migrations/migration_lock.toml">
@@ -20869,6 +20622,175 @@ provider = "postgresql"
 }
 </file>
 
+<file path="src/controllers/ingestion.controller.ts">
+import { Request, Response, NextFunction } from "express";
+import fs from "fs";
+import { parse } from "csv-parse";
+import { profileCache } from "../lib/cache";
+import { sendError } from "../utils/response.utils";
+import { findExistingNames, insertProfiles, ValidRow } from "../model/ingestion.model";
+
+const CHUNK_SIZE = 500;
+const VALID_GENDERS = ["male", "female"];
+const VALID_AGE_GROUPS = ["child", "teenager", "adult", "senior"];
+
+interface SkipReasons {
+  duplicate_name: number;
+  invalid_age: number;
+  missing_fields: number;
+  invalid_gender: number;
+  malformed_row: number;
+}
+const processChunk = async (
+  rows: ValidRow[],
+  inserted: { count: number },
+  reasons: SkipReasons
+): Promise<void> => {
+  const names = rows.map((r) => r.name);
+  const existingNames = await findExistingNames(names);
+
+  const toInsert = rows.filter((r) => {
+    if (existingNames.has(r.name)) {
+      reasons.duplicate_name++;
+      return false;
+    }
+    return true;
+  });
+
+  if (toInsert.length === 0) return;
+
+  await insertProfiles(toInsert);
+
+  inserted.count += toInsert.length;
+};
+
+export const uploadCSV = async (
+  req: Request,
+  res: Response,
+  next: NextFunction
+): Promise<void> => {
+  if (!req.file) {
+    sendError(res, 400, "No file uploaded");
+    return;
+  }
+
+  const filePath = req.file.path;
+
+  let totalRows = 0;
+  const inserted = { count: 0 };
+  const reasons: SkipReasons = {
+    duplicate_name: 0,
+    invalid_age: 0,
+    missing_fields: 0,
+    invalid_gender: 0,
+    malformed_row: 0,
+  };
+
+  try {
+    const chunk: ValidRow[] = [];
+
+    const parser = fs.createReadStream(filePath).pipe(
+      parse({
+        columns: true,
+        skip_empty_lines: true,
+        trim: true,
+        relax_column_count: false,
+      })
+    );
+
+    for await (const row of parser) {
+      totalRows++;
+
+      const {
+        name,
+        gender,
+        gender_probability,
+        age,
+        age_group,
+        country_id,
+        country_probability,
+      } = row;
+
+      if (
+        !name ||
+        !gender ||
+        gender_probability === undefined ||
+        age === undefined ||
+        !age_group ||
+        !country_id ||
+        country_probability === undefined
+      ) {
+        reasons.missing_fields++;
+        continue;
+      }
+
+      if (!VALID_GENDERS.includes((gender as string).toLowerCase())) {
+        reasons.invalid_gender++;
+        continue;
+      }
+
+      const parsedAge = Number(age);
+      if (isNaN(parsedAge) || parsedAge < 0 || !Number.isInteger(parsedAge)) {
+        reasons.invalid_age++;
+        continue;
+      }
+
+      if (!VALID_AGE_GROUPS.includes(age_group as string)) {
+        reasons.invalid_age++;
+        continue;
+      }
+
+      const parsedGenderProb = Number(gender_probability);
+      const parsedCountryProb = Number(country_probability);
+
+      if (isNaN(parsedGenderProb) || isNaN(parsedCountryProb)) {
+        reasons.malformed_row++;
+        continue;
+      }
+
+      chunk.push({
+        name: (name as string).trim(),
+        gender: (gender as string).toLowerCase(),
+        gender_probability: parsedGenderProb,
+        age: parsedAge,
+        age_group: age_group as string,
+        country_id: (country_id as string).toUpperCase(),
+        country_name: (row.country_name as string) || null,
+        country_probability: parsedCountryProb,
+      });
+
+      if (chunk.length === CHUNK_SIZE) {
+        await processChunk(chunk, inserted, reasons);
+        chunk.length = 0;
+      }
+    }
+
+    if (chunk.length > 0) {
+      await processChunk(chunk, inserted, reasons);
+    }
+
+  } catch (error) {
+    fs.unlink(filePath, () => {});
+    next(error);
+    return;
+  }
+
+  fs.unlink(filePath, () => {});
+
+  profileCache.invalidate();
+
+  const skipped = totalRows - inserted.count;
+
+  res.status(200).json({
+    status: "success",
+    total_rows: totalRows,
+    inserted: inserted.count,
+    skipped,
+    reasons,
+  });
+};
+</file>
+
 <file path="src/index.ts">
 import { createApp } from "./config/app.config.js";
 import dotenv from "dotenv";
@@ -20958,6 +20880,41 @@ export const requireApiVersion = (req: Request, res: Response, next: NextFunctio
     return;
   }
   next();
+};
+</file>
+
+<file path="src/model/ingestion.model.ts">
+import { prisma } from "../lib/prisma";
+import { uuidv7 } from "uuidv7";
+
+export interface ValidRow {
+  name: string;
+  gender: string;
+  gender_probability: number;
+  age: number;
+  age_group: string;
+  country_id: string;
+  country_name: string | null;
+  country_probability: number;
+}
+
+export const findExistingNames = async (names: string[]): Promise<Set<string>> => {
+  const existing = await prisma.profile.findMany({
+    where: { name: { in: names } },
+    select: { name: true },
+  });
+
+  return new Set(existing.map((e) => e.name));
+};
+
+export const insertProfiles = async (rows: ValidRow[]): Promise<void> => {
+  await prisma.profile.createMany({
+    data: rows.map((r) => ({
+      id: uuidv7(),
+      ...r,
+    })),
+    skipDuplicates: true,
+  });
 };
 </file>
 
@@ -21647,59 +21604,6 @@ export default tseslint.config(
 );
 </file>
 
-<file path="prisma/schema.prisma">
-// This is your Prisma schema file,
-// learn more about it in the docs: https://pris.ly/d/prisma-schema
-
-// Get a free hosted Postgres database in seconds: `npx create-db`
-
-generator client {
-  provider = "prisma-client-js"
-
-}
-
-datasource db {
-  provider = "postgresql"
-}
-
-model Profile {
-  id                  String   @id
-  name                String   @unique
-  gender              String
-  gender_probability  Float
-  age                 Int
-  age_group           String
-  country_id          String
-  country_name        String?
-  country_probability Float
-  created_at          DateTime @default(now())
-
-  
-  @@index([gender])
-  @@index([age_group])
-  @@index([country_id])
-  @@index([age])
-  @@index([gender_probability])
-
-
-  
-  @@index([gender, age_group, country_id])
-}
-
-model User {
-  id            String    @id
-  github_id     String    @unique
-  username      String
-  email         String
-  avatar_url    String
-  role          String    @default("analyst")
-  is_active     Boolean   @default(true)
-  refresh_token  String?
-  last_login_at DateTime?
-  created_at    DateTime  @default(now())
-}
-</file>
-
 <file path="scripts/gen-admin-token.ts">
 import "dotenv/config";
 import { PrismaPg } from "@prisma/adapter-pg";
@@ -21806,6 +21710,33 @@ export const apiRateLimiter = rateLimit({
 });
 </file>
 
+<file path="src/middlewares/upload.middleware.ts">
+import multer from "multer";
+import path from "path";
+import os from "os";
+import { Request } from "express";
+
+const storage = multer.diskStorage({
+  destination: (_req, _file, cb) => {
+    cb(null, "os.tmpdir()"); // Save to system temp directory
+  },
+  filename: (_req, file, cb) => {
+    const unique = `${Date.now()}-${Math.round(Math.random() * 1e9)}`;
+    cb(null, `${unique}${path.extname(file.originalname)}`);
+  },
+});
+
+const fileFilter = (_req: Request, file: Express.Multer.File, cb: multer.FileFilterCallback) => {
+  if (file.mimetype === "text/csv") {
+    cb(null, true);
+  } else {
+    cb(new Error("Only CSV files are allowed"));
+  }
+};
+
+export const upload = multer({ storage, fileFilter });
+</file>
+
 <file path="src/routes/auth.route.ts">
 import { Router } from "express";
 import {
@@ -21832,6 +21763,27 @@ router.get("/me", authenticate, getMe);
 
 // logout requires a valid access token — you must be logged in to log out
 router.post("/logout", authenticate, logout);
+
+export default router;
+</file>
+
+<file path="src/routes/ingestion.route.ts">
+import { Router } from "express";           
+import { uploadCSV } from "../controllers/ingestion.controller";
+import { authenticate, requireRole } from "../middlewares/auth.middleware";
+import { apiRateLimiter } from "../middlewares/ratelimit.middleware";
+import { requireApiVersion } from "../middlewares/apiversion.middleware";
+import { upload } from "../middlewares/upload.middleware";
+
+const router = Router();
+
+// All ingestion routes require authentication, admin role, rate limiting, and API version header
+router.use(requireApiVersion);
+router.use(authenticate);
+router.use(apiRateLimiter);
+
+// Only admins can bulk upload
+router.post("/", requireRole("admin"), upload.single("file"), uploadCSV);
 
 export default router;
 </file>
@@ -22000,6 +21952,60 @@ export const fetchGitHubEmail = async (accessToken: string): Promise<string | nu
     return null;
   }
 };
+</file>
+
+<file path="prisma/schema.prisma">
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+// Get a free hosted Postgres database in seconds: `npx create-db`
+
+generator client {
+  provider = "prisma-client-js"
+
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+model Profile {
+  id                  String   @id
+  name                String   @unique
+  gender              String
+  gender_probability  Float
+  age                 Int
+  age_group           String
+  country_id          String
+  country_name        String?
+  country_probability Float
+  created_at          DateTime @default(now())
+
+  
+  @@index([gender])
+  @@index([age_group])
+  @@index([country_id])
+  @@index([age])
+  @@index([gender_probability])
+  @@index([created_at]) 
+
+
+  
+  @@index([gender, age_group, country_id])
+}
+
+model User {
+  id            String    @id
+  github_id     String    @unique
+  username      String
+  email         String
+  avatar_url    String
+  role          String    @default("analyst")
+  is_active     Boolean   @default(true)
+  refresh_token  String?
+  last_login_at DateTime?
+  created_at    DateTime  @default(now())
+}
 </file>
 
 <file path="prisma/seed.ts">
@@ -23302,6 +23308,51 @@ export const setRefreshToken = (userId: string, token: string | null) => {
 };
 </file>
 
+<file path="scripts/gen-token.ts">
+import "dotenv/config";
+import { PrismaPg } from "@prisma/adapter-pg";
+import { PrismaClient } from "@prisma/client";
+import { Pool } from "pg";
+import { generateAccessToken } from "../src/utils/jwt.utils";
+
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  max: 1,
+  idleTimeoutMillis: 10000,
+  connectionTimeoutMillis: 10000,
+  ssl: { rejectUnauthorized: false },
+});
+
+const adapter = new PrismaPg(pool);
+const prisma = new PrismaClient({ adapter });
+
+async function main() {
+  const analyst = await prisma.user.findUnique({
+    where: { github_id: "test-analyst-github-id" },
+  });
+
+  if (!analyst) {
+    console.log("No seeded analyst user found — run: npx prisma db seed");
+    return;
+  }
+
+  if (!analyst.is_active) {
+    console.log("Seeded analyst user is deactivated — check your DB");
+    return;
+  }
+
+  const token = generateAccessToken(analyst.id, analyst.role);
+
+  console.log("\n── Option 2 Analyst Token ───────────────────────────────");
+  console.log("\nAnalyst Test Token (paste into submission form):");
+  console.log(token);
+  console.log("\n  This token expires in 3 minutes — submit immediately after copying");
+  console.log("─────────────────────────────────────────────────────────\n");
+}
+
+main().finally(() => prisma.$disconnect());
+</file>
+
 <file path="package.json">
 {
   "name": "stage1",
@@ -23359,51 +23410,6 @@ export const setRefreshToken = (userId: string, token: string | null) => {
     "typescript-eslint": "^8.0.0"
   }
 }
-</file>
-
-<file path="scripts/gen-token.ts">
-import "dotenv/config";
-import { PrismaPg } from "@prisma/adapter-pg";
-import { PrismaClient } from "@prisma/client";
-import { Pool } from "pg";
-import { generateAccessToken } from "../src/utils/jwt.utils";
-
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  max: 1,
-  idleTimeoutMillis: 10000,
-  connectionTimeoutMillis: 10000,
-  ssl: { rejectUnauthorized: false },
-});
-
-const adapter = new PrismaPg(pool);
-const prisma = new PrismaClient({ adapter });
-
-async function main() {
-  const analyst = await prisma.user.findUnique({
-    where: { github_id: "test-analyst-github-id" },
-  });
-
-  if (!analyst) {
-    console.log("No seeded analyst user found — run: npx prisma db seed");
-    return;
-  }
-
-  if (!analyst.is_active) {
-    console.log("Seeded analyst user is deactivated — check your DB");
-    return;
-  }
-
-  const token = generateAccessToken(analyst.id, analyst.role);
-
-  console.log("\n── Option 2 Analyst Token ───────────────────────────────");
-  console.log("\nAnalyst Test Token (paste into submission form):");
-  console.log(token);
-  console.log("\n  This token expires in 3 minutes — submit immediately after copying");
-  console.log("─────────────────────────────────────────────────────────\n");
-}
-
-main().finally(() => prisma.$disconnect());
 </file>
 
 <file path="src/config/app.config.ts">
