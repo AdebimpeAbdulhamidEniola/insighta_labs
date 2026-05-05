@@ -1,10 +1,11 @@
 import multer from "multer";
 import path from "path";
+import os from "os";
 import { Request } from "express";
 
 const storage = multer.diskStorage({
   destination: (_req, _file, cb) => {
-    cb(null, "uploads/");
+    cb(null, "os.tmpdir()"); // Save to system temp directory
   },
   filename: (_req, file, cb) => {
     const unique = `${Date.now()}-${Math.round(Math.random() * 1e9)}`;

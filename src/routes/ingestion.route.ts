@@ -10,7 +10,6 @@ const router = Router();
 // All ingestion routes require authentication, admin role, rate limiting, and API version header
 router.use(requireApiVersion);
 router.use(authenticate);
-router.use(requireRole("admin"));
 router.use(apiRateLimiter);
 
 // Only admins can bulk upload

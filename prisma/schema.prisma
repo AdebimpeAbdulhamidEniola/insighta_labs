@@ -30,6 +30,7 @@ model Profile {
   @@index([country_id])
   @@index([age])
   @@index([gender_probability])
+  @@index([created_at]) 
 
 
   
