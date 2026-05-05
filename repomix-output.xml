@@ -52,6 +52,7 @@ prisma/migrations/20260420190454_remove_sample_size/migration.sql
 prisma/migrations/20260426060614_add_user/migration.sql
 prisma/migrations/20260426132235_add_column/migration.sql
 prisma/migrations/20260427072532_make_country_name_optional/migration.sql
+prisma/migrations/20260505081225_add_profile_indexes/migration.sql
 prisma/migrations/migration_lock.toml
 prisma/schema.prisma
 prisma/seed.ts
@@ -61,15 +62,20 @@ scripts/gen-token.ts
 seed_profiles.json
 src/config/app.config.ts
 src/controllers/auth.controller.ts
+src/controllers/ingestion.controller.ts
 src/controllers/profile.controller.ts
 src/index.ts
+src/lib/cache.ts
 src/lib/prisma.ts
 src/middlewares/apiversion.middleware.ts
 src/middlewares/auth.middleware.ts
 src/middlewares/ratelimit.middleware.ts
+src/middlewares/upload.middleware.ts
 src/model/auth.model.ts
+src/model/ingestion.model.ts
 src/model/profile.model.ts
 src/routes/auth.route.ts
+src/routes/ingestion.route.ts
 src/routes/profile.route.ts
 src/routes/user.routes.ts
 src/services/agify.service.ts
@@ -78,6 +84,7 @@ src/services/github.services.ts
 src/services/nationalize.service.ts
 src/types/express.d.ts
 src/utils/apperror.utils.ts
+src/utils/cache-key.utils.ts
 src/utils/errorhandler.utils.ts
 src/utils/jwt.utils.ts
 src/utils/nlp.utils.ts
@@ -89,6 +96,259 @@ tsconfig.json
 
 <files>
 This section contains the contents of the repository's files.
+
+<file path="src/controllers/ingestion.controller.ts">
+import { Request, Response, NextFunction } from "express";
+import fs from "fs";
+import { parse } from "csv-parse";
+import { profileCache } from "../lib/cache";
+import { sendError } from "../utils/response.utils";
+import { findExistingNames, insertProfiles, ValidRow } from "../model/ingestion.model";
+
+const CHUNK_SIZE = 500;
+const VALID_GENDERS = ["male", "female"];
+const VALID_AGE_GROUPS = ["child", "teenager", "adult", "senior"];
+
+interface SkipReasons {
+  duplicate_name: number;
+  invalid_age: number;
+  missing_fields: number;
+  invalid_gender: number;
+  malformed_row: number;
+}
+
+const processChunk = async (
+  rows: ValidRow[],
+  inserted: { count: number },
+  reasons: SkipReasons
+): Promise<void> => {
+  const names = rows.map((r) => r.name);
+  const existingNames = await findExistingNames(names);
+
+  const toInsert = rows.filter((r) => {
+    if (existingNames.has(r.name)) {
+      reasons.duplicate_name++;
+      return false;
+    }
+    return true;
+  });
+
+  if (toInsert.length === 0) return;
+
+  await insertProfiles(toInsert);
+
+  inserted.count += toInsert.length;
+};
+
+export const uploadCSV = async (
+  req: Request,
+  res: Response,
+  next: NextFunction
+): Promise<void> => {
+  if (!req.file) {
+    sendError(res, 400, "No file uploaded");
+    return;
+  }
+
+  const filePath = req.file.path;
+
+  let totalRows = 0;
+  const inserted = { count: 0 };
+  const reasons: SkipReasons = {
+    duplicate_name: 0,
+    invalid_age: 0,
+    missing_fields: 0,
+    invalid_gender: 0,
+    malformed_row: 0,
+  };
+
+  try {
+    const chunk: ValidRow[] = [];
+
+    const parser = fs.createReadStream(filePath).pipe(
+      parse({
+        columns: true,
+        skip_empty_lines: true,
+        trim: true,
+        relax_column_count: false,
+      })
+    );
+
+    for await (const row of parser) {
+      totalRows++;
+
+      const {
+        name,
+        gender,
+        gender_probability,
+        age,
+        age_group,
+        country_id,
+        country_probability,
+      } = row;
+
+      if (
+        !name ||
+        !gender ||
+        gender_probability === undefined ||
+        age === undefined ||
+        !age_group ||
+        !country_id ||
+        country_probability === undefined
+      ) {
+        reasons.missing_fields++;
+        continue;
+      }
+
+      if (!VALID_GENDERS.includes((gender as string).toLowerCase())) {
+        reasons.invalid_gender++;
+        continue;
+      }
+
+      const parsedAge = Number(age);
+      if (isNaN(parsedAge) || parsedAge < 0 || !Number.isInteger(parsedAge)) {
+        reasons.invalid_age++;
+        continue;
+      }
+
+      if (!VALID_AGE_GROUPS.includes(age_group as string)) {
+        reasons.invalid_age++;
+        continue;
+      }
+
+      const parsedGenderProb = Number(gender_probability);
+      const parsedCountryProb = Number(country_probability);
+
+      if (isNaN(parsedGenderProb) || isNaN(parsedCountryProb)) {
+        reasons.malformed_row++;
+        continue;
+      }
+
+      chunk.push({
+        name: (name as string).trim(),
+        gender: (gender as string).toLowerCase(),
+        gender_probability: parsedGenderProb,
+        age: parsedAge,
+        age_group: age_group as string,
+        country_id: (country_id as string).toUpperCase(),
+        country_name: (row.country_name as string) || null,
+        country_probability: parsedCountryProb,
+      });
+
+      if (chunk.length === CHUNK_SIZE) {
+        await processChunk(chunk, inserted, reasons);
+        chunk.length = 0;
+      }
+    }
+
+    if (chunk.length > 0) {
+      await processChunk(chunk, inserted, reasons);
+    }
+
+  } catch (error) {
+    fs.unlink(filePath, () => {});
+    next(error);
+    return;
+  }
+
+  fs.unlink(filePath, () => {});
+
+  profileCache.invalidate();
+
+  const skipped = totalRows - inserted.count;
+
+  res.status(200).json({
+    status: "success",
+    total_rows: totalRows,
+    inserted: inserted.count,
+    skipped,
+    reasons,
+  });
+};
+</file>
+
+<file path="src/middlewares/upload.middleware.ts">
+import multer from "multer";
+import path from "path";
+import { Request } from "express";
+
+const storage = multer.diskStorage({
+  destination: (_req, _file, cb) => {
+    cb(null, "uploads/");
+  },
+  filename: (_req, file, cb) => {
+    const unique = `${Date.now()}-${Math.round(Math.random() * 1e9)}`;
+    cb(null, `${unique}${path.extname(file.originalname)}`);
+  },
+});
+
+const fileFilter = (_req: Request, file: Express.Multer.File, cb: multer.FileFilterCallback) => {
+  if (file.mimetype === "text/csv") {
+    cb(null, true);
+  } else {
+    cb(new Error("Only CSV files are allowed"));
+  }
+};
+
+export const upload = multer({ storage, fileFilter });
+</file>
+
+<file path="src/model/ingestion.model.ts">
+import { prisma } from "../lib/prisma";
+import { uuidv7 } from "uuidv7";
+
+export interface ValidRow {
+  name: string;
+  gender: string;
+  gender_probability: number;
+  age: number;
+  age_group: string;
+  country_id: string;
+  country_name: string | null;
+  country_probability: number;
+}
+
+export const findExistingNames = async (names: string[]): Promise<Set<string>> => {
+  const existing = await prisma.profile.findMany({
+    where: { name: { in: names } },
+    select: { name: true },
+  });
+
+  return new Set(existing.map((e) => e.name));
+};
+
+export const insertProfiles = async (rows: ValidRow[]): Promise<void> => {
+  await prisma.profile.createMany({
+    data: rows.map((r) => ({
+      id: uuidv7(),
+      ...r,
+    })),
+    skipDuplicates: true,
+  });
+};
+</file>
+
+<file path="src/routes/ingestion.route.ts">
+import { Router } from "express";           
+import { uploadCSV } from "../controllers/ingestion.controller";
+import { authenticate, requireRole } from "../middlewares/auth.middleware";
+import { apiRateLimiter } from "../middlewares/ratelimit.middleware";
+import { requireApiVersion } from "../middlewares/apiversion.middleware";
+import { upload } from "../middlewares/upload.middleware";
+
+const router = Router();
+
+// All ingestion routes require authentication, admin role, rate limiting, and API version header
+router.use(requireApiVersion);
+router.use(authenticate);
+router.use(requireRole("admin"));
+router.use(apiRateLimiter);
+
+// Only admins can bulk upload
+router.post("/", requireRole("admin"), upload.single("file"), uploadCSV);
+
+export default router;
+</file>
 
 <file path=".github/workflows/ci.yml">
 name: CI
@@ -316,53 +576,30 @@ ALTER TABLE "User" ADD COLUMN     "refresh_token" TEXT;
 ALTER TABLE "Profile" ALTER COLUMN "country_name" DROP NOT NULL;
 </file>
 
+<file path="prisma/migrations/20260505081225_add_profile_indexes/migration.sql">
+-- CreateIndex
+CREATE INDEX "Profile_gender_idx" ON "Profile"("gender");
+
+-- CreateIndex
+CREATE INDEX "Profile_age_group_idx" ON "Profile"("age_group");
+
+-- CreateIndex
+CREATE INDEX "Profile_country_id_idx" ON "Profile"("country_id");
+
+-- CreateIndex
+CREATE INDEX "Profile_age_idx" ON "Profile"("age");
+
+-- CreateIndex
+CREATE INDEX "Profile_gender_probability_idx" ON "Profile"("gender_probability");
+
+-- CreateIndex
+CREATE INDEX "Profile_gender_age_group_country_id_idx" ON "Profile"("gender", "age_group", "country_id");
+</file>
+
 <file path="prisma/migrations/migration_lock.toml">
 # Please do not edit this file manually
 # It should be added in your version-control system (e.g., Git)
 provider = "postgresql"
-</file>
-
-<file path="prisma/schema.prisma">
-// This is your Prisma schema file,
-// learn more about it in the docs: https://pris.ly/d/prisma-schema
-
-// Get a free hosted Postgres database in seconds: `npx create-db`
-
-generator client {
-  provider = "prisma-client-js"
-
-}
-
-datasource db {
-  provider = "postgresql"
-}
-
-model Profile {
-  id                  String   @id
-  name                String   @unique
-  gender              String
-  gender_probability  Float
-  age                 Int
-  age_group           String
-  country_id          String
-  country_name        String?
-  country_probability Float
-  created_at          DateTime @default(now())
-}
-
-
-model User {
-  id            String    @id
-  github_id     String    @unique
-  username      String
-  email         String
-  avatar_url    String
-  role          String    @default("analyst")
-  is_active     Boolean   @default(true)
-  refresh_token  String?
-  last_login_at DateTime?
-  created_at    DateTime  @default(now())
-}
 </file>
 
 <file path="seed_profiles.json">
@@ -20651,6 +20888,52 @@ if (!process.env.VERCEL) {
 export default app;
 </file>
 
+<file path="src/lib/cache.ts">
+// src/lib/cache.ts
+
+interface CacheEntry<T> {
+  value: T;
+  expiresAt: number;
+}
+
+class InMemoryCache {
+  private store = new Map<string, CacheEntry<unknown>>();
+  private readonly ttlMs: number;
+
+  constructor(ttlSeconds: number = 3600) {
+    this.ttlMs = ttlSeconds * 1000;
+  }
+
+  get<T>(key: string): T | null {
+    const entry = this.store.get(key);
+
+    // Key doesn't exist
+    if (!entry) return null;
+
+    // Key exists but has expired
+    if (Date.now() > entry.expiresAt) {
+      this.store.delete(key);
+      return null;
+    }
+
+    return entry.value as T;
+  }
+
+  set<T>(key: string, value: T): void {
+    this.store.set(key, {
+      value,
+      expiresAt: Date.now() + this.ttlMs,
+    });
+  }
+
+  invalidate(): void {
+    this.store.clear();
+  }
+}
+
+export const profileCache = new InMemoryCache(3600); // Cache entries expire after 1 hour
+</file>
+
 <file path="src/lib/prisma.ts">
 import "dotenv/config";
 import { PrismaPg } from "@prisma/adapter-pg";
@@ -20979,6 +21262,31 @@ export class AppError extends Error {
     this.statusCode = statusCode;
   }
 }
+</file>
+
+<file path="src/utils/cache-key.utils.ts">
+// src/utils/cache-key.utils.ts
+
+//normalization of queries
+import { ProfileFilters } from "../model/profile.model";
+
+export const buildCacheKey = (filters: ProfileFilters): string => {
+  // Remove undefined values
+  const cleaned = Object.fromEntries(
+    Object.entries(filters).filter(([, v]) => v !== undefined)
+  );
+
+  // Sort keys alphabetically so order never matters
+  
+  const sorted = Object.keys(cleaned)
+    .sort()
+    .reduce<Record<string, unknown>>((acc, key) => {
+      acc[key] = cleaned[key];
+      return acc;
+    }, {});
+
+  return `profiles:${JSON.stringify(sorted)}`;
+};
 </file>
 
 <file path="src/utils/errorhandler.utils.ts">
@@ -21339,6 +21647,59 @@ export default tseslint.config(
 );
 </file>
 
+<file path="prisma/schema.prisma">
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+// Get a free hosted Postgres database in seconds: `npx create-db`
+
+generator client {
+  provider = "prisma-client-js"
+
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+model Profile {
+  id                  String   @id
+  name                String   @unique
+  gender              String
+  gender_probability  Float
+  age                 Int
+  age_group           String
+  country_id          String
+  country_name        String?
+  country_probability Float
+  created_at          DateTime @default(now())
+
+  
+  @@index([gender])
+  @@index([age_group])
+  @@index([country_id])
+  @@index([age])
+  @@index([gender_probability])
+
+
+  
+  @@index([gender, age_group, country_id])
+}
+
+model User {
+  id            String    @id
+  github_id     String    @unique
+  username      String
+  email         String
+  avatar_url    String
+  role          String    @default("analyst")
+  is_active     Boolean   @default(true)
+  refresh_token  String?
+  last_login_at DateTime?
+  created_at    DateTime  @default(now())
+}
+</file>
+
 <file path="scripts/gen-admin-token.ts">
 import "dotenv/config";
 import { PrismaPg } from "@prisma/adapter-pg";
@@ -21391,394 +21752,6 @@ async function main() {
 }
 
 main().finally(() => prisma.$disconnect());
-</file>
-
-<file path="src/controllers/profile.controller.ts">
-import { Request, Response, NextFunction } from "express";
-import { sendError } from "../utils/response.utils";
-import {
-  findAllProfiles,
-  findAllProfilesForExport,
-  findProfileById,
-  createProfile,
-  findProfileByName,
-  deleteProfile
-} from "../model/profile.model.js";
-import { parseNaturalQuery } from "../utils/nlp.utils";
-import { getGenderData } from "../services/genderize.service";
-import { getAgeData } from "../services/agify.service";
-import { getNationData } from "../services/nationalize.service";
-import { uuidv7 } from "uuidv7";
-
-const VALID_GENDERS = ["male", "female"];
-const VALID_AGE_GROUPS = ["child", "teenager", "adult", "senior"];
-const VALID_SORT_BY = ["age", "created_at", "gender_probability"];
-const VALID_ORDER = ["asc", "desc"];
-
-// Safely wraps a CSV cell — quotes the value if it contains commas, quotes, or newlines
-const escapeCSV = (value: unknown): string => {
-  const str = value === null || value === undefined ? "" : String(value);
-  if (str.includes(",") || str.includes('"') || str.includes("\n")) {
-    return `"${str.replace(/"/g, '""')}"`;
-  }
-  return str;
-};
-
-export const getAllProfiles = async (
-  req: Request,
-  res: Response,
-  next: NextFunction
-) => {
-  try {
-    const {
-      gender,
-      age_group,
-      country_id,
-      min_age,
-      max_age,
-      min_gender_probability,
-      min_country_probability,
-      sort_by,
-      order,
-      page,
-      limit,
-    } = req.query;
-
-    if (gender !== undefined && !VALID_GENDERS.includes(gender as string)) {
-      return sendError(res, 422, "Invalid query parameters");
-    }
-    if (age_group !== undefined && !VALID_AGE_GROUPS.includes(age_group as string)) {
-      return sendError(res, 422, "Invalid query parameters");
-    }
-    if (sort_by !== undefined && !VALID_SORT_BY.includes(sort_by as string)) {
-      return sendError(res, 422, "Invalid query parameters");
-    }
-    if (order !== undefined && !VALID_ORDER.includes(order as string)) {
-      return sendError(res, 422, "Invalid query parameters");
-    }
-
-    const parsedMinAge = min_age ? Number(min_age) : undefined;
-    const parsedMaxAge = max_age ? Number(max_age) : undefined;
-    const parsedMinGenderProb = min_gender_probability ? Number(min_gender_probability) : undefined;
-    const parsedMinCountryProb = min_country_probability ? Number(min_country_probability) : undefined;
-    const parsedPage = page ? Number(page) : undefined;
-    const parsedLimit = limit ? Number(limit) : undefined;
-
-    if (parsedMinAge !== undefined && isNaN(parsedMinAge)) {
-      return sendError(res, 422, "Invalid query parameters");
-    }
-    if (parsedMaxAge !== undefined && isNaN(parsedMaxAge)) {
-      return sendError(res, 422, "Invalid query parameters");
-    }
-    if (parsedMinGenderProb !== undefined && isNaN(parsedMinGenderProb)) {
-      return sendError(res, 422, "Invalid query parameters");
-    }
-    if (parsedMinCountryProb !== undefined && isNaN(parsedMinCountryProb)) {
-      return sendError(res, 422, "Invalid query parameters");
-    }
-    if (parsedPage !== undefined && (isNaN(parsedPage) || parsedPage < 1)) {
-      return sendError(res, 422, "Invalid query parameters");
-    }
-    if (parsedLimit !== undefined && (isNaN(parsedLimit) || parsedLimit < 1)) {
-      return sendError(res, 422, "Invalid query parameters");
-    }
-
-    const result = await findAllProfiles({
-      gender: typeof gender === "string" ? gender : undefined,
-      age_group: typeof age_group === "string" ? age_group : undefined,
-      country_id: typeof country_id === "string" ? country_id : undefined,
-      min_age: parsedMinAge,
-      max_age: parsedMaxAge,
-      min_gender_probability: parsedMinGenderProb,
-      min_country_probability: parsedMinCountryProb,
-      sort_by: sort_by as "age" | "created_at" | "gender_probability" | undefined,
-      order: order as "asc" | "desc" | undefined,
-      page: parsedPage,
-      limit: parsedLimit,
-    });
-
-    const totalPages = Math.ceil(result.total / result.limit);
-
-    return res.status(200).json({
-      status: "success",
-      page: result.page,
-      limit: result.limit,
-      total: result.total,
-      total_pages: totalPages,
-      links: {
-        self: `/api/profiles?page=${result.page}&limit=${result.limit}`,
-        next: result.page < totalPages
-          ? `/api/profiles?page=${result.page + 1}&limit=${result.limit}`
-          : null,
-        prev: result.page > 1
-          ? `/api/profiles?page=${result.page - 1}&limit=${result.limit}`
-          : null,
-      },
-      data: result.data,
-    });
-  } catch (error) {
-    next(error);
-  }
-};
-
-export const searchProfiles = async (
-  req: Request,
-  res: Response,
-  next: NextFunction
-) => {
-  try {
-    const { q, page, limit } = req.query;
-
-    if (!q || (q as string).trim() === "") {
-      return sendError(res, 400, "Missing or empty query");
-    }
-
-    const filters = parseNaturalQuery(q as string);
-
-    if (!filters) {
-      return res.status(400).json({
-        status: "error",
-        message: "Unable to interpret query",
-      });
-    }
-
-    const parsedPage = page ? Number(page) : undefined;
-    const parsedLimit = limit ? Number(limit) : undefined;
-
-    if (parsedPage !== undefined && (isNaN(parsedPage) || parsedPage < 1)) {
-      return sendError(res, 422, "Invalid query parameters");
-    }
-    if (parsedLimit !== undefined && (isNaN(parsedLimit) || parsedLimit < 1)) {
-      return sendError(res, 422, "Invalid query parameters");
-    }
-
-    const result = await findAllProfiles({
-      ...filters,
-      page: parsedPage,
-      limit: parsedLimit,
-    });
-
-    const totalPages = Math.ceil(result.total / result.limit);
-
-    return res.status(200).json({
-      status: "success",
-      page: result.page,
-      limit: result.limit,
-      total: result.total,
-      total_pages: totalPages,
-      links: {
-        self: `/api/profiles/search?page=${result.page}&limit=${result.limit}`,
-        next: result.page < totalPages
-          ? `/api/profiles/search?page=${result.page + 1}&limit=${result.limit}`
-          : null,
-        prev: result.page > 1
-          ? `/api/profiles/search?page=${result.page - 1}&limit=${result.limit}`
-          : null,
-      },
-      data: result.data,
-    });
-  } catch (error) {
-    next(error);
-  }
-};
-
-export const getProfileById = async (
-  req: Request<{ id: string }>,
-  res: Response,
-  next: NextFunction
-) => {
-  try {
-    const { id } = req.params;
-
-    const profile = await findProfileById(id);
-
-    if (!profile) {
-      return sendError(res, 404, "Profile not found");
-    }
-
-    return res.status(200).json({
-      status: "success",
-      data: profile,
-    });
-  } catch (error) {
-    next(error);
-  }
-};
-
-export const createUserProfile = async (
-  req: Request,
-  res: Response,
-  next: NextFunction
-) => {
-  try {
-    const { name } = req.body;
-
-    if (name === undefined) return sendError(res, 400, "Missing name");
-    if (Array.isArray(name) || typeof name !== "string") return sendError(res, 422, "Invalid type");
-    if (name.trim() === "") return sendError(res, 400, "Empty name");
-    if (/^\d+$/.test(name.trim())) return sendError(res, 422, "Invalid type");
-
-    const existingProfile = await findProfileByName(name);
-    if (existingProfile) {
-      return res.status(200).json({
-        status: "success",
-        message: "Profile already exists",
-        data: existingProfile,
-      });
-    }
-
-    const [genderData, ageData, nationData] = await Promise.all([
-      getGenderData(name),
-      getAgeData(name),
-      getNationData(name),
-    ]);
-
-    const newProfile = await createProfile({
-      id: uuidv7(),
-      name,
-      gender: genderData.gender,
-      gender_probability: genderData.gender_probability,
-      age: ageData.age,
-      age_group: ageData.age_group,
-      country_id: nationData.country_id,
-      country_probability: nationData.country_probability,
-    });
-
-    return res.status(201).json({
-      status: "success",
-      data: newProfile,
-    });
-  } catch (error) {
-    next(error);
-  }
-};
-
-export const exportProfiles = async (
-  req: Request,
-  res: Response,
-  next: NextFunction
-) => {
-  try {
-    const {
-      format,
-      gender,
-      age_group,
-      country_id,
-      min_age,
-      max_age,
-      min_gender_probability,
-      min_country_probability,
-      sort_by,
-      order,
-    } = req.query;
-
-    // Validate format param
-    if (format !== "csv") {
-      return sendError(res, 400, "format=csv is required");
-    }
-
-    // Validate optional filter params
-    if (gender !== undefined && !VALID_GENDERS.includes(gender as string)) {
-      return sendError(res, 422, "Invalid query parameters");
-    }
-    if (age_group !== undefined && !VALID_AGE_GROUPS.includes(age_group as string)) {
-      return sendError(res, 422, "Invalid query parameters");
-    }
-    if (sort_by !== undefined && !VALID_SORT_BY.includes(sort_by as string)) {
-      return sendError(res, 422, "Invalid query parameters");
-    }
-    if (order !== undefined && !VALID_ORDER.includes(order as string)) {
-      return sendError(res, 422, "Invalid query parameters");
-    }
-
-    const parsedMinAge = min_age ? Number(min_age) : undefined;
-    const parsedMaxAge = max_age ? Number(max_age) : undefined;
-    const parsedMinGenderProb = min_gender_probability ? Number(min_gender_probability) : undefined;
-    const parsedMinCountryProb = min_country_probability ? Number(min_country_probability) : undefined;
-
-    if (parsedMinAge !== undefined && isNaN(parsedMinAge)) {
-      return sendError(res, 422, "Invalid query parameters");
-    }
-    if (parsedMaxAge !== undefined && isNaN(parsedMaxAge)) {
-      return sendError(res, 422, "Invalid query parameters");
-    }
-    if (parsedMinGenderProb !== undefined && isNaN(parsedMinGenderProb)) {
-      return sendError(res, 422, "Invalid query parameters");
-    }
-    if (parsedMinCountryProb !== undefined && isNaN(parsedMinCountryProb)) {
-      return sendError(res, 422, "Invalid query parameters");
-    }
-
-    // Fetch ALL matching profiles — no pagination cap
-    const profiles = await findAllProfilesForExport({
-      gender: typeof gender === "string" ? gender : undefined,
-      age_group: typeof age_group === "string" ? age_group : undefined,
-      country_id: typeof country_id === "string" ? country_id : undefined,
-      min_age: parsedMinAge,
-      max_age: parsedMaxAge,
-      min_gender_probability: parsedMinGenderProb,
-      min_country_probability: parsedMinCountryProb,
-      sort_by: sort_by as "age" | "created_at" | "gender_probability" | undefined,
-      order: order as "asc" | "desc" | undefined,
-    });
-
-    // TRD column order: id, name, gender, gender_probability, age, age_group,
-    //                   country_id, country_name, country_probability, created_at
-    const header = "id,name,gender,gender_probability,age,age_group,country_id,country_name,country_probability,created_at";
-
-    const rows = profiles.map((p) =>
-      [
-        escapeCSV(p.id),
-        escapeCSV(p.name),
-        escapeCSV(p.gender),
-        escapeCSV(p.gender_probability),
-        escapeCSV(p.age),
-        escapeCSV(p.age_group),
-        escapeCSV(p.country_id),
-        escapeCSV(p.country_name),
-        escapeCSV(p.country_probability),
-        escapeCSV(p.created_at.toISOString()),
-      ].join(",")
-    );
-
-    const csv = [header, ...rows].join("\n");
-
-    res.setHeader("Content-Type", "text/csv");
-    res.setHeader(
-      "Content-Disposition",
-      `attachment; filename="profiles_${Date.now()}.csv"`
-    );
-    return res.status(200).send(csv);
-  } catch (error) {
-    next(error);
-  }
-};
-
-export const deleteUserProfile = async (
-  req: Request<{ id: string }>,
-  res: Response,
-  next: NextFunction
-) => {
-  try {
-    const { id } = req.params;
-
-    // Check existence first so we return 404 (not a Prisma crash)
-    const existing = await findProfileById(id);
-    if (!existing) {
-      return sendError(res, 404, "Profile not found");
-    }
-
-    await deleteProfile(id);
-
-    return res.status(200).json({
-      status: "success",
-      message: "Profile deleted successfully",
-    });
-
-  } catch (error) {
-    next(error);
-  }
-}
 </file>
 
 <file path="src/middlewares/ratelimit.middleware.ts">
@@ -22706,6 +22679,476 @@ npm test           # Run Jest test suite
 - CI must pass before merge
 </file>
 
+<file path="src/controllers/profile.controller.ts">
+import { Request, Response, NextFunction } from "express";
+import { sendError } from "../utils/response.utils";
+import {
+  findAllProfiles,
+  findAllProfilesForExport,
+  findProfileById,
+  createProfile,
+  findProfileByName,
+  deleteProfile
+} from "../model/profile.model.js";
+import { parseNaturalQuery } from "../utils/nlp.utils";
+import { getGenderData } from "../services/genderize.service";
+import { getAgeData } from "../services/agify.service";
+import { getNationData } from "../services/nationalize.service";
+import { uuidv7 } from "uuidv7";
+import { profileCache } from "../lib/cache";
+import { buildCacheKey } from "../utils/cache-key.utils";
+
+type ProfileQueryResult = {
+  data: {
+    id: string;
+    name: string;
+    gender: string;
+    gender_probability: number;
+    age: number;
+    age_group: string;
+    country_id: string;
+    country_name: string | null;
+    country_probability: number;
+    created_at: Date;
+  }[];
+  total: number;
+  page: number;
+  limit: number;
+};
+
+const VALID_GENDERS = ["male", "female"];
+const VALID_AGE_GROUPS = ["child", "teenager", "adult", "senior"];
+const VALID_SORT_BY = ["age", "created_at", "gender_probability"];
+const VALID_ORDER = ["asc", "desc"];
+
+// Safely wraps a CSV cell — quotes the value if it contains commas, quotes, or newlines
+const escapeCSV = (value: unknown): string => {
+  const str = value === null || value === undefined ? "" : String(value);
+  if (str.includes(",") || str.includes('"') || str.includes("\n")) {
+    return `"${str.replace(/"/g, '""')}"`;
+  }
+  return str;
+};
+
+export const getAllProfiles = async (
+  req: Request,
+  res: Response,
+  next: NextFunction
+) => {
+  try {
+    const {
+      gender,
+      age_group,
+      country_id,
+      min_age,
+      max_age,
+      min_gender_probability,
+      min_country_probability,
+      sort_by,
+      order,
+      page,
+      limit,
+    } = req.query;
+
+    
+    if (gender !== undefined && !VALID_GENDERS.includes(gender as string)) {
+      return sendError(res, 422, "Invalid query parameters");
+    }
+    if (age_group !== undefined && !VALID_AGE_GROUPS.includes(age_group as string)) {
+      return sendError(res, 422, "Invalid query parameters");
+    }
+    if (sort_by !== undefined && !VALID_SORT_BY.includes(sort_by as string)) {
+      return sendError(res, 422, "Invalid query parameters");
+    }
+    if (order !== undefined && !VALID_ORDER.includes(order as string)) {
+      return sendError(res, 422, "Invalid query parameters");
+    }
+
+    const parsedMinAge = min_age ? Number(min_age) : undefined;
+    const parsedMaxAge = max_age ? Number(max_age) : undefined;
+    const parsedMinGenderProb = min_gender_probability ? Number(min_gender_probability) : undefined;
+    const parsedMinCountryProb = min_country_probability ? Number(min_country_probability) : undefined;
+    const parsedPage = page ? Number(page) : undefined;
+    const parsedLimit = limit ? Number(limit) : undefined;
+
+    if (parsedMinAge !== undefined && isNaN(parsedMinAge)) {
+      return sendError(res, 422, "Invalid query parameters");
+    }
+    if (parsedMaxAge !== undefined && isNaN(parsedMaxAge)) {
+      return sendError(res, 422, "Invalid query parameters");
+    }
+    if (parsedMinGenderProb !== undefined && isNaN(parsedMinGenderProb)) {
+      return sendError(res, 422, "Invalid query parameters");
+    }
+    if (parsedMinCountryProb !== undefined && isNaN(parsedMinCountryProb)) {
+      return sendError(res, 422, "Invalid query parameters");
+    }
+    if (parsedPage !== undefined && (isNaN(parsedPage) || parsedPage < 1)) {
+      return sendError(res, 422, "Invalid query parameters");
+    }
+    if (parsedLimit !== undefined && (isNaN(parsedLimit) || parsedLimit < 1)) {
+      return sendError(res, 422, "Invalid query parameters");
+    }
+   
+    const filters = {
+      gender: typeof gender === "string" ? gender : undefined,
+      age_group: typeof age_group === "string" ? age_group : undefined,
+      country_id: typeof country_id === "string" ? country_id : undefined,
+      min_age: parsedMinAge,
+      max_age: parsedMaxAge,
+      min_gender_probability: parsedMinGenderProb,
+      min_country_probability: parsedMinCountryProb,
+      sort_by: sort_by as "age" | "created_at" | "gender_probability" | undefined,
+      order: order as "asc" | "desc" | undefined,
+      page: parsedPage,
+      limit: parsedLimit,
+    };
+
+    // ── Cache check ────────────────────────────────────────
+    const cacheKey = buildCacheKey(filters);
+    const cached = profileCache.get<ProfileQueryResult>(cacheKey);
+    if (cached) {
+      const totalPages = Math.ceil(cached.total / cached.limit);
+      return res.status(200).json({
+        status: "success",
+        page: cached.page,
+        limit: cached.limit,
+        total: cached.total,
+        total_pages: totalPages,
+        links: {
+          self: `/api/profiles?page=${cached.page}&limit=${cached.limit}`,
+          next: cached.page < totalPages
+            ? `/api/profiles?page=${cached.page + 1}&limit=${cached.limit}`
+            : null,
+          prev: cached.page > 1
+            ? `/api/profiles?page=${cached.page - 1}&limit=${cached.limit}`
+            : null,
+        },
+        data: cached.data,
+      });
+    }
+    // ──────────────────────────────────────────────────────
+
+    // Cache miss — query the database
+    const result = await findAllProfiles(filters);
+
+    // Store in cache before responding
+    profileCache.set(cacheKey, result);
+
+    const totalPages = Math.ceil(result.total / result.limit);
+
+    return res.status(200).json({
+      status: "success",
+      page: result.page,
+      limit: result.limit,
+      total: result.total,
+      total_pages: totalPages,
+      links: {
+        self: `/api/profiles?page=${result.page}&limit=${result.limit}`,
+        next: result.page < totalPages
+          ? `/api/profiles?page=${result.page + 1}&limit=${result.limit}`
+          : null,
+        prev: result.page > 1
+          ? `/api/profiles?page=${result.page - 1}&limit=${result.limit}`
+          : null,
+      },
+      data: result.data,
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+export const searchProfiles = async (
+  req: Request,
+  res: Response,
+  next: NextFunction
+) => {
+  try {
+    const { q, page, limit } = req.query;
+
+    if (!q || (q as string).trim() === "") {
+      return sendError(res, 400, "Missing or empty query");
+    }
+
+    const filters = parseNaturalQuery(q as string);
+
+    if (!filters) {
+      return res.status(400).json({
+        status: "error",
+        message: "Unable to interpret query",
+      });
+    }
+
+    const parsedPage = page ? Number(page) : undefined;
+    const parsedLimit = limit ? Number(limit) : undefined;
+
+    if (parsedPage !== undefined && (isNaN(parsedPage) || parsedPage < 1)) {
+      return sendError(res, 422, "Invalid query parameters");
+    }
+    if (parsedLimit !== undefined && (isNaN(parsedLimit) || parsedLimit < 1)) {
+      return sendError(res, 422, "Invalid query parameters");
+    }
+
+    // ── Cache check ──────────────────────────────────────
+    const cacheKey = buildCacheKey({ ...filters, page: parsedPage, limit: parsedLimit });
+    const cached = profileCache.get<ProfileQueryResult>(cacheKey);
+    if (cached) {
+      const totalPages = Math.ceil(cached.total / cached.limit);
+      return res.status(200).json({
+        status: "success",
+        page: cached.page,
+        limit: cached.limit,
+        total: cached.total,
+        total_pages: totalPages,
+        links: {
+          self: `/api/profiles/search?page=${cached.page}&limit=${cached.limit}`,
+          next: cached.page < totalPages
+            ? `/api/profiles/search?page=${cached.page + 1}&limit=${cached.limit}`
+            : null,
+          prev: cached.page > 1
+            ? `/api/profiles/search?page=${cached.page - 1}&limit=${cached.limit}`
+            : null,
+        },
+        data: cached.data,
+      });
+    }
+    // ────────────────────────────────────────────────────
+
+    const result = await findAllProfiles({
+      ...filters,
+      page: parsedPage,
+      limit: parsedLimit,
+    });
+
+    profileCache.set(cacheKey, result);
+
+    const totalPages = Math.ceil(result.total / result.limit);
+
+    return res.status(200).json({
+      status: "success",
+      page: result.page,
+      limit: result.limit,
+      total: result.total,
+      total_pages: totalPages,
+      links: {
+        self: `/api/profiles/search?page=${result.page}&limit=${result.limit}`,
+        next: result.page < totalPages
+          ? `/api/profiles/search?page=${result.page + 1}&limit=${result.limit}`
+          : null,
+        prev: result.page > 1
+          ? `/api/profiles/search?page=${result.page - 1}&limit=${result.limit}`
+          : null,
+      },
+      data: result.data,
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+export const getProfileById = async (
+  req: Request<{ id: string }>,
+  res: Response,
+  next: NextFunction
+) => {
+  try {
+    const { id } = req.params;
+
+    const profile = await findProfileById(id);
+
+    if (!profile) {
+      return sendError(res, 404, "Profile not found");
+    }
+
+    return res.status(200).json({
+      status: "success",
+      data: profile,
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+export const createUserProfile = async (
+  req: Request,
+  res: Response,
+  next: NextFunction
+) => {
+  try {
+    const { name } = req.body;
+
+    if (name === undefined) return sendError(res, 400, "Missing name");
+    if (Array.isArray(name) || typeof name !== "string") return sendError(res, 422, "Invalid type");
+    if (name.trim() === "") return sendError(res, 400, "Empty name");
+    if (/^\d+$/.test(name.trim())) return sendError(res, 422, "Invalid type");
+
+    const existingProfile = await findProfileByName(name);
+    if (existingProfile) {
+      return res.status(200).json({
+        status: "success",
+        message: "Profile already exists",
+        data: existingProfile,
+      });
+    }
+
+    const [genderData, ageData, nationData] = await Promise.all([
+      getGenderData(name),
+      getAgeData(name),
+      getNationData(name),
+    ]);
+
+    const newProfile = await createProfile({
+      id: uuidv7(),
+      name,
+      gender: genderData.gender,
+      gender_probability: genderData.gender_probability,
+      age: ageData.age,
+      age_group: ageData.age_group,
+      country_id: nationData.country_id,
+      country_probability: nationData.country_probability,
+    });
+
+    profileCache.invalidate()
+
+    return res.status(201).json({
+      status: "success",
+      data: newProfile,
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+export const exportProfiles = async (
+  req: Request,
+  res: Response,
+  next: NextFunction
+) => {
+  try {
+    const {
+      format,
+      gender,
+      age_group,
+      country_id,
+      min_age,
+      max_age,
+      min_gender_probability,
+      min_country_probability,
+      sort_by,
+      order,
+    } = req.query;
+
+    // Validate format param
+    if (format !== "csv") {
+      return sendError(res, 400, "format=csv is required");
+    }
+
+    // Validate optional filter params
+    if (gender !== undefined && !VALID_GENDERS.includes(gender as string)) {
+      return sendError(res, 422, "Invalid query parameters");
+    }
+    if (age_group !== undefined && !VALID_AGE_GROUPS.includes(age_group as string)) {
+      return sendError(res, 422, "Invalid query parameters");
+    }
+    if (sort_by !== undefined && !VALID_SORT_BY.includes(sort_by as string)) {
+      return sendError(res, 422, "Invalid query parameters");
+    }
+    if (order !== undefined && !VALID_ORDER.includes(order as string)) {
+      return sendError(res, 422, "Invalid query parameters");
+    }
+
+    const parsedMinAge = min_age ? Number(min_age) : undefined;
+    const parsedMaxAge = max_age ? Number(max_age) : undefined;
+    const parsedMinGenderProb = min_gender_probability ? Number(min_gender_probability) : undefined;
+    const parsedMinCountryProb = min_country_probability ? Number(min_country_probability) : undefined;
+
+    if (parsedMinAge !== undefined && isNaN(parsedMinAge)) {
+      return sendError(res, 422, "Invalid query parameters");
+    }
+    if (parsedMaxAge !== undefined && isNaN(parsedMaxAge)) {
+      return sendError(res, 422, "Invalid query parameters");
+    }
+    if (parsedMinGenderProb !== undefined && isNaN(parsedMinGenderProb)) {
+      return sendError(res, 422, "Invalid query parameters");
+    }
+    if (parsedMinCountryProb !== undefined && isNaN(parsedMinCountryProb)) {
+      return sendError(res, 422, "Invalid query parameters");
+    }
+
+    // Fetch ALL matching profiles — no pagination cap
+    const profiles = await findAllProfilesForExport({
+      gender: typeof gender === "string" ? gender : undefined,
+      age_group: typeof age_group === "string" ? age_group : undefined,
+      country_id: typeof country_id === "string" ? country_id : undefined,
+      min_age: parsedMinAge,
+      max_age: parsedMaxAge,
+      min_gender_probability: parsedMinGenderProb,
+      min_country_probability: parsedMinCountryProb,
+      sort_by: sort_by as "age" | "created_at" | "gender_probability" | undefined,
+      order: order as "asc" | "desc" | undefined,
+    });
+
+    // TRD column order: id, name, gender, gender_probability, age, age_group,
+    //                   country_id, country_name, country_probability, created_at
+    const header = "id,name,gender,gender_probability,age,age_group,country_id,country_name,country_probability,created_at";
+
+    const rows = profiles.map((p) =>
+      [
+        escapeCSV(p.id),
+        escapeCSV(p.name),
+        escapeCSV(p.gender),
+        escapeCSV(p.gender_probability),
+        escapeCSV(p.age),
+        escapeCSV(p.age_group),
+        escapeCSV(p.country_id),
+        escapeCSV(p.country_name),
+        escapeCSV(p.country_probability),
+        escapeCSV(p.created_at.toISOString()),
+      ].join(",")
+    );
+
+    const csv = [header, ...rows].join("\n");
+
+    res.setHeader("Content-Type", "text/csv");
+    res.setHeader(
+      "Content-Disposition",
+      `attachment; filename="profiles_${Date.now()}.csv"`
+    );
+    return res.status(200).send(csv);
+  } catch (error) {
+    next(error);
+  }
+};
+
+export const deleteUserProfile = async (
+  req: Request<{ id: string }>,
+  res: Response,
+  next: NextFunction
+) => {
+  try {
+    const { id } = req.params;
+
+    // Check existence first so we return 404 (not a Prisma crash)
+    const existing = await findProfileById(id);
+    if (!existing) {
+      return sendError(res, 404, "Profile not found");
+    }
+
+    await deleteProfile(id);
+    profileCache.invalidate()
+
+    return res.status(200).json({
+      status: "success",
+      message: "Profile deleted successfully",
+    });
+
+  } catch (error) {
+    next(error);
+  }
+}
+</file>
+
 <file path="src/middlewares/auth.middleware.ts">
 import { Request, Response, NextFunction } from "express";
 import { verifyAccessToken } from "../utils/jwt.utils.js";
@@ -22883,11 +23326,13 @@ export const setRefreshToken = (userId: string, token: string | null) => {
     "axios": "^1.15.2",
     "cookie-parser": "^1.4.7",
     "cors": "^2.8.6",
+    "csv-parse": "^6.2.1",
     "dotenv": "^17.4.2",
     "express": "^5.2.1",
     "express-rate-limit": "^8.4.1",
     "jsonwebtoken": "^9.0.3",
     "morgan": "^1.10.1",
+    "multer": "^2.1.1",
     "pg": "^8.20.0",
     "uuidv7": "^1.2.1"
   },
@@ -22899,6 +23344,7 @@ export const setRefreshToken = (userId: string, token: string | null) => {
     "@types/jest": "^29.5.0",
     "@types/jsonwebtoken": "^9.0.10",
     "@types/morgan": "^1.9.10",
+    "@types/multer": "^2.1.0",
     "@types/node": "^25.6.0",
     "@types/pg": "^8.20.0",
     "@types/uuid": "^10.0.0",
@@ -22971,6 +23417,7 @@ import { errorHandler } from "../utils/errorhandler.utils";
 import ProfileRouter from "../routes/profile.route";
 import AuthRouter from "../routes/auth.route";
 import UsersRouter from "../routes/user.routes";
+import IngestionRouter from "../routes/ingestion.route";
 
 dotenv.config();
 
@@ -22983,24 +23430,15 @@ export const createApp = (): Application => {
   app.set("trust proxy", 1); // Trust first proxy (important for correct client IP in rate limiting)
   app.use(express.json());
 
-  // cookie-parser must come BEFORE routes so req.cookies is populated
-  // when the auth middleware reads the access_token cookie from web portal requests
   app.use(cookieParser());
 
   // Log every request including in production
   app.use(morgan(process.env.NODE_ENV === "production" ? "combined" : "dev"));
 
-  // credentials: true is required so the browser sends HTTP-only cookies
-  // cross-origin (web portal origin → backend origin).
-  // The origin must be explicit (not "*") when credentials are involved.
-
   app.use(
   cors({
     origin: process.env.FRONTEND_URL || "http://localhost:3001",
     credentials: true,
-    // Tell the browser these custom headers are allowed cross-origin
-    // Without this, the preflight OPTIONS request blocks X-API-Version
-    // and the actual API request is never sent
     allowedHeaders: ["Content-Type", "Authorization", "X-API-Version"],
     exposedHeaders: ["RateLimit-Limit", "RateLimit-Remaining", "RateLimit-Reset"],
   })
@@ -23010,6 +23448,7 @@ export const createApp = (): Application => {
   app.use("/auth", AuthRouter);
   app.use("/api/profiles", ProfileRouter);
   app.use("/api/users", UsersRouter);
+  app.use("/api/ingest", IngestionRouter);
 
 
   // Not Found Handler
